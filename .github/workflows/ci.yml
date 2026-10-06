@@ -22,7 +22,7 @@ jobs:
       matrix:
         cc: [gcc, clang]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install toolchain
         run: sudo apt-get update && sudo apt-get install -y ninja-build clang
@@ -43,7 +43,7 @@ jobs:
       matrix:
         preset: [asan]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install toolchain
         run: sudo apt-get update && sudo apt-get install -y ninja-build clang
@@ -56,16 +56,18 @@ jobs:
       - name: Build and test
         run: ./test.sh ${{ matrix.preset }}
 
-  # clang-cl against the MSVC headers and libraries.  msvc-dev-cmd puts the
+  # clang-cl against the MSVC headers and libraries.  setup-msvc-dev puts the
   # MSVC environment on PATH so Ninja and clang-cl can find the linker and
   # the Windows SDK.
   windows:
     name: windows (clang-cl)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: x64
 
       - name: Configure
         run: cmake --preset debug -DCMAKE_C_COMPILER=clang-cl
@@ -83,7 +85,7 @@ jobs:
     name: macos (clang)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install toolchain
         run: brew install ninja
