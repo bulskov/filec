@@ -1,0 +1,98 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Run by hand, e.g. after a dependency (seqc, ctt) released something.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Two compilers, because a bug can be invisible under one of them.
+  # test.sh also rejects malloc/free in src/.
+  linux:
+    name: linux (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang
+
+      # Dependencies are fetched at configure time, so this needs network.
+      - name: Build and test
+        env:
+          CC: ${{ matrix.cc }}
+        run: ./test.sh debug
+
+  # ASan+UBSan.  Add tsan to the matrix once the watcher uses threads.
+  # The presets pin clang.
+  sanitizers:
+    name: linux (${{ matrix.preset }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [asan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang
+
+      # The runner kernel randomises 32 bits of mmap addresses; the sanitizer
+      # runtimes assume fewer and abort with "unexpected memory mapping".
+      - name: Reduce mmap randomisation for the sanitizers
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Build and test
+        run: ./test.sh ${{ matrix.preset }}
+
+  # clang-cl against the MSVC headers and libraries.  msvc-dev-cmd puts the
+  # MSVC environment on PATH so Ninja and clang-cl can find the linker and
+  # the Windows SDK.
+  windows:
+    name: windows (clang-cl)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        run: cmake --preset debug -DCMAKE_C_COMPILER=clang-cl
+
+      - name: Build
+        run: cmake --build --preset debug
+
+      - name: Test
+        run: ctest --preset debug
+
+  # macOS is not a supported platform yet; this job keeps src/posix/ honest
+  # about what is Linux-only (statx, copy_file_range, renameat2,
+  # inotify).  Free on a public repo.
+  macos:
+    name: macos (clang)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: brew install ninja
+
+      - name: Configure
+        run: cmake --preset debug
+
+      - name: Build
+        run: cmake --build --preset debug
+
+      - name: Test
+        run: ctest --preset debug
