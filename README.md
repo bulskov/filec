@@ -75,6 +75,29 @@ to one copy.
 4. Watching, locations, volumes.
 5. Win32 backend for all of the above.
 
+## Build
+
+CMake ≥ 3.20 and Ninja. Dependencies are fetched at configure time.
+
+```sh
+./build.sh            # debug build      (presets: debug, release, asan, tsan, dev)
+./test.sh             # build + ctest    (modes:   debug, asan, tsan, dev)
+./test.sh dev         # against local checkouts ../seqc and ../ctt
+```
+
+The `asan` and `tsan` presets use clang. `test.sh` also fails if `malloc`/`free`
+appear in `src/` — memory comes from the caller's `allocator_t`.
+
+Use from another project:
+
+```cmake
+FetchContent_Declare(filec
+    GIT_REPOSITORY https://github.com/bulskov/filec.git
+    GIT_TAG        main)
+FetchContent_MakeAvailable(filec)
+target_link_libraries(app PRIVATE filec::filec)
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
