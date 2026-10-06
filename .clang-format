@@ -1,0 +1,12 @@
+BasedOnStyle: Microsoft
+
+# Wrap at 80 columns (half a typical screen)
+ColumnLimit: 80
+
+# Function call arguments: if they don't fit on one line, put each on its own
+AlignAfterOpenBracket: AlwaysBreak
+BinPackArguments: false
+BinPackParameters: false
+
+# Long conditions (&&, ||): break before the operator so it leads the line
+BreakBeforeBinaryOperators: NonAssignment
