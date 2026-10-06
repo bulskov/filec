@@ -53,12 +53,12 @@ include(FetchContent)
 
 set(FILEC_SEQC_GIT_REPOSITORY "https://github.com/bulskov/seqc.git"
     CACHE STRING "Clone URL for the seqc dependency")
-set(FILEC_SEQC_GIT_TAG "v2.0.1"
+set(FILEC_SEQC_GIT_TAG "v2.2.0"
     CACHE STRING "Tag or commit of the seqc dependency")
-set(FILEC_CTT_GIT_TAG "v0.2.1"
+set(FILEC_CTT_GIT_TAG "v0.3.1"
     CACHE STRING "Tag or commit of the ctt dependency (tests only)")
 
-# seqc calls include(CTest) and would otherwise build its own googletest suite
+# seqc calls include(CTest) and would otherwise build its own ctt suite
 # into ours.  Only force this when we own the cache (top level).
 if(FILEC_TOP_LEVEL)
     set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
