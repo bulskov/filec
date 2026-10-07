@@ -3,10 +3,13 @@
  *
  * STATUS: DRAFT INTERFACE — not implemented yet.  See docs/interface.md.
  *
- * Paths in:  UTF-8 string_t in canonical '/' form (see filec/path.h).  Need
- *            not be NUL-terminated.  Each call converts the path (NUL
- *            termination on POSIX, UTF-16 + "\\?\" prefix on Windows) into a
- *            conversion buffer — see "Path buffers" below.
+ * Paths:     every path in and out is CANONICAL and normalised (see
+ *            filec/path.h): "/C:/Users/me", not "C:\Users\me".  Each call
+ *            converts to the native form itself (path_to_native, plus NUL
+ *            termination on POSIX, UTF-16 and the "\\?\" prefix on Windows)
+ *            in a conversion buffer — see "Path buffers" below.  Paths typed
+ *            by a user or given on a command line go through fs_from_native
+ *            first.  Need not be NUL-terminated.
  * Names out: raw bytes.  On Linux they may be invalid UTF-8; nothing is
  *            "fixed" here — sanitising for display is the caller's job.
  * Blocking:  every function may block on I/O.  Call them from worker threads
@@ -142,11 +145,7 @@ fs_dir_t *fs_dir_open_buf(
  * 0 with err->kind == FS_OK means end of directory.  An entry that vanished
  * between listing and stat is skipped, not an error. */
 size_t fs_dir_read(
-    fs_dir_t *d,
-    fs_entry_t *out,
-    size_t cap,
-    allocator_t names,
-    fs_err_t *err);
+    fs_dir_t *d, fs_entry_t *out, size_t cap, allocator_t names, fs_err_t *err);
 
 void fs_dir_close(fs_dir_t *d);
 
@@ -268,9 +267,16 @@ typedef enum
 string_t fs_location(fs_loc_t loc, allocator_t a, fs_err_t *err);
 string_t fs_cwd(allocator_t a, fs_err_t *err);
 
+/* Any native path the OS would accept -> canonical, absolute, normalised.
+ * Unlike path_from_native (filec/native.h), relative forms are resolved
+ * against the real current directory, including Windows' "C:x" (drive C's
+ * current directory) and "\x" (root of the current drive).  For paths
+ * typed by a user or given on a command line. */
+string_t fs_from_native(string_t native, allocator_t a, fs_err_t *err);
+
 typedef struct
 {
-    string_t path;  /* "/", "/media/usb", "C:/", "//srv/share/" */
+    string_t path;  /* "/", "/media/usb", "/C:", "/UNC/srv/share" */
     string_t label; /* volume label, may be ""                  */
     bool removable;
     bool network;

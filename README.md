@@ -3,7 +3,8 @@
 Portable paths and filesystem access for C11 — POSIX and Win32 backends.
 
 > **Status: design draft.** The interfaces in
-> [`include/filec/path.h`](include/filec/path.h) and
+> [`include/filec/path.h`](include/filec/path.h),
+> [`include/filec/native.h`](include/filec/native.h) and
 > [`include/filec/fs.h`](include/filec/fs.h) are proposals; nothing is
 > implemented yet. The reasoning behind them is in
 > [`docs/interface.md`](docs/interface.md).
@@ -24,12 +25,16 @@ It was started for fskim (a fast, handmade file manager), so it has to be
 *fast* and *honest* about the filesystem — but it has no knowledge of fskim and
 should be useful anywhere.
 
-It has two parts:
+It has three parts:
 
-- **`path`** — pure string logic on `string_t`: root, parent, file name,
-  extension, join, normalise, relative, compare. No syscalls. Every function
-  takes a path style (`PATH_POSIX` / `PATH_WINDOWS`), so Windows path rules are
-  tested on Linux and vice versa.
+- **`path`** — pure string logic on one **canonical** path form, the same on
+  every platform (`/home/me`, and on Windows `/C:/Users/me`): parent, file
+  name, extension, join, normalise, relative, compare. No syscalls, no
+  platform.
+- **`native`** — conversion between native paths (`C:\Users\me`,
+  `\\server\share`) and canonical ones. All platform path syntax lives here;
+  pure string code with a style parameter, so Windows rules are tested on
+  Linux and vice versa.
 - **`fs`** — the OS boundary: directory listing, stat, positional file I/O,
   mkdir / rename / remove / copy with progress and cancel, trash, locations,
   volumes, and change watching.
@@ -49,12 +54,13 @@ Goals:
 ## Planned layout
 
 ```
-include/filec/path.h     lexical paths — no OS code
+include/filec/path.h     canonical paths — no OS code, no platform
+include/filec/native.h   native <-> canonical conversion — no OS code
 include/filec/fs.h       filesystem
-src/path/                path implementation
+src/path/                path and native implementation
 src/posix/               Linux first; macOS later
 src/win32/               Win32 backend
-tests/                   ctt tests; path tests run both styles on every OS
+tests/                   ctt tests; native tests run both styles on every OS
 ```
 
 ## Dependencies
@@ -69,11 +75,12 @@ to one copy.
 
 ## Suggested order of work
 
-1. `path` — pure logic, test-heavy, both styles. A good place to start.
-2. `fs` reading: `fs_dir_*`, `fs_stat`, files.
-3. `fs` changing: mkdir, remove, rename, copy, trash.
-4. Watching, locations, volumes.
-5. Win32 backend for all of the above.
+1. `path` — pure logic, test-heavy. A good place to start.
+2. `native` — the Windows and POSIX conversion rules.
+3. `fs` reading: `fs_dir_*`, `fs_stat`, files.
+4. `fs` changing: mkdir, remove, rename, copy, trash.
+5. Watching, locations, volumes.
+6. Win32 backend for all of the above.
 
 ## Build
 

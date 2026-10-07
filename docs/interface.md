@@ -14,51 +14,78 @@ teaches us things.
 | Allocation only through a passed `allocator_t` | Same rule as seqc. The caller decides lifetimes (typically one arena per job). |
 | Independent of threadc | Cancellation is a C11 `atomic_bool *`; filec must be usable without threadc. |
 
-## path — lexical, no OS
+## path — canonical paths, no platform
 
-### Canonical form
+### Two layers: canonical core, native conversion at the boundary
 
-Inside the program, paths always use `/`. Windows input with `\` is accepted
-under `PATH_WINDOWS` and normalised to `/`. Conversion to the native look
-happens only:
+The path core (`filec/path.h`) knows exactly one syntax, the **canonical
+form**, and no platform at all: no style parameter, no `#ifdef`, no `\`, no
+drive roots, no `\\?\` prefixes. Every function — parent, file name,
+extension, join, normalise, relative, compare — works on that one form, so
+its tests are identical on every platform.
 
-- at the OS boundary, inside `fs` (to UTF-16 and `\\?\` long-path form), and
-- for display, with `path_to_display`.
+All platform syntax lives in one place, `filec/native.h`, which converts
+between native and canonical paths:
 
-Benefits: one representation to compare, hash (`path_hash`, consistent with
-`path_equals`) and test.
+- **in** — `path_from_native`, when a path comes from the OS or a user;
+- **out** — `path_to_native`, for the OS or for display.
 
-### Style parameter instead of `#ifdef`
+`native.h` is pure string code too, with a style parameter
+(`PATH_STYLE_POSIX` / `PATH_STYLE_WINDOWS`), so the whole Windows rule set is
+tested in Linux CI and the POSIX rules on Windows. `fs` takes and returns
+canonical paths and converts internally.
 
-Every function takes a `path_style_t`. `PATH_NATIVE` picks the platform's
-style. This means the whole Windows rule set — drive letters, UNC roots,
-`\\?\` prefixes, case-insensitive comparison — is unit tested in Linux CI, and
-POSIX rules on Windows.
+### The canonical form
 
-### Root forms to support under `PATH_WINDOWS`
+- `/` is the only separator.
+- Absolute exactly when it starts with `/`; the only root is `/`.
+- Windows drives and shares become ordinary first components:
 
-| Input | Root (canonical) | Note |
-|---|---|---|
-| `C:\x` | `C:/` | drive absolute |
-| `C:x` | `C:` | drive *relative* — not absolute; decide whether to reject |
-| `\x` | `/` | root of current drive — not absolute on Windows |
-| `\\server\share\x` | `//server/share/` | UNC |
-| `\\?\C:\x` | `C:/` | long-path prefix stripped on input |
-| `\\?\UNC\server\share\x` | `//server/share/` | long UNC |
+| Native (Windows) | Canonical |
+|---|---|
+| `C:\Users\me`, `C:/Users/me`, `c:\Users\me` | `/C:/Users/me` |
+| `\\server\share\x` | `/UNC/server/share/x` |
+| `\\?\C:\very\long` | `/C:/very/long` |
+| `\\?\UNC\server\share\x` | `/UNC/server/share/x` |
+| `C:x` (drive-relative), `\x` (current drive's root) | refused by `path_from_native`; `fs_from_native` resolves them against the real current directory |
+
+On Windows `/` is therefore a **virtual root** whose children are the drives —
+"This PC" in Explorer terms. `path_parent("/C:")` is `/`, so navigating up
+works the same way on every platform; only `path_to_native` refuses `/` (and
+relative paths that lead through it), because it has no native form.
+
+### Normalised paths
+
+No empty components, no `.`, no `..` except leading ones in a relative path,
+no trailing `/` except the root, and `.` for the empty relative path.
+Everything filec hands out is normalised, and the anatomy functions expect
+normalised input; `path_normalize` and `path_join` accept anything.
+
+### Comparison is the one platform-dependent question
+
+Whether `A` and `a` name the same file depends on the platform (and on macOS
+the volume), not on the path. So `path_equals`, `path_compare`,
+`path_starts_with`, `path_hash` and `path_relative` take a `path_case_t`
+(`PATH_CASE_SENSITIVE` / `PATH_CASE_INSENSITIVE`, `PATH_CASE_NATIVE`).
+Comparison is component by component: `/foo` is not a prefix of `/foobar`, and
+a directory sorts directly before its contents (`/a` < `/a/b` < `/a-b`) — the
+order a file tree wants.
 
 ### Views vs allocation
 
-Anatomy functions (`root`, `parent`, `file_name`, `stem`, `extension`) return
+Anatomy functions (`parent`, `file_name`, `stem`, `extension`) return
 **views** into the input — no allocation. Anything that builds a new string
-takes an `allocator_t` and returns `{NULL, 0}` on OOM.
+takes an `allocator_t`, always returns memory from it (never a view, so the
+lifetime is always the allocator's), and returns `{NULL, 0}` on OOM.
 
 ### Known limitations (deliberate)
 
-- `PATH_WINDOWS` folds ASCII case only. NTFS uses a per-volume upcase table;
-  modelling it is out of scope.
+- `PATH_CASE_INSENSITIVE` folds ASCII only. NTFS uses a per-volume upcase
+  table; modelling it is out of scope.
 - No Unicode normalisation (NFC/NFD). Matters on macOS; out of scope for now.
 - `..` is resolved lexically. `/a/link/..` is `/a`, even if `link` points
-  elsewhere. Use `fs_real_path` when that matters.
+  elsewhere, and the parent of `..` is `.`. Use `fs_real_path` when that
+  matters.
 
 ## fs — the OS boundary
 
@@ -177,8 +204,6 @@ first addition once the needs are clear.
 ## Open questions
 
 - Path buffers: which of the three options above for `_buf` variants?
-- `C:x` (drive-relative) and `\x` (current-drive root) on Windows: support,
-  or reject as `FS_ERR_INVALID`?
 - `fs_volumes` on Linux: which mounts count as "pseudo" (proc, sysfs, cgroup,
   tmpfs?, overlay?) and are hidden?
 - Does `fs_entry_t` need `atime`, owner/group, or link target?

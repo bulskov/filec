@@ -1,5 +1,5 @@
-/* filec/path — lexical path manipulation.  No OS code: the same file builds
- * on every platform, and both path styles are tested everywhere.
+/* filec/path — lexical manipulation of canonical paths.  No OS code and no
+ * platform: the same file, and the same tests, everywhere.
  *
  * Empty scaffold: the implementation of include/filec/path.h goes here. */
 
