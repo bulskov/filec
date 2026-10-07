@@ -142,11 +142,7 @@ fs_dir_t *fs_dir_open_buf(
  * 0 with err->kind == FS_OK means end of directory.  An entry that vanished
  * between listing and stat is skipped, not an error. */
 size_t fs_dir_read(
-    fs_dir_t *d,
-    fs_entry_t *out,
-    size_t cap,
-    allocator_t names,
-    fs_err_t *err);
+    fs_dir_t *d, fs_entry_t *out, size_t cap, allocator_t names, fs_err_t *err);
 
 void fs_dir_close(fs_dir_t *d);
 
