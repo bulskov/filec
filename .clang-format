@@ -10,3 +10,19 @@ BinPackParameters: false
 
 # Long conditions (&&, ||): break before the operator so it leads the line
 BreakBeforeBinaryOperators: NonAssignment
+
+# Always braces around if / else / for / while / do bodies, even single
+# statements: explicit, and adding a second line can never silently fall
+# outside the body.
+InsertBraces: true
+
+# Include order within a block: "ctt.h" always first — it must come before
+# any standard header under strict -std=c99/c11.  Then the other quoted
+# headers, then system headers.
+IncludeCategories:
+  - Regex: '^"ctt\.h"$'
+    Priority: -1
+  - Regex: '^<'
+    Priority: 3
+  - Regex: '.*'
+    Priority: 1
