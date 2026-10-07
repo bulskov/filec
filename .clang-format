@@ -10,3 +10,8 @@ BinPackParameters: false
 
 # Long conditions (&&, ||): break before the operator so it leads the line
 BreakBeforeBinaryOperators: NonAssignment
+
+# Always braces around if / else / for / while / do bodies, even single
+# statements: explicit, and adding a second line can never silently fall
+# outside the body.
+InsertBraces: true
