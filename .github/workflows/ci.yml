@@ -17,6 +17,9 @@ jobs:
   linux:
     name: linux (${{ matrix.cc }})
     runs-on: ubuntu-latest
+    # A hung step (seen: apt-get for 6 h) fails here instead of
+    # running into GitHub's 6-hour limit.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -38,6 +41,9 @@ jobs:
   sanitizers:
     name: linux (${{ matrix.preset }})
     runs-on: ubuntu-latest
+    # A hung step (seen: apt-get for 6 h) fails here instead of
+    # running into GitHub's 6-hour limit.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +68,9 @@ jobs:
   windows:
     name: windows (clang-cl)
     runs-on: windows-latest
+    # A hung step (seen: apt-get for 6 h) fails here instead of
+    # running into GitHub's 6-hour limit.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -84,6 +93,9 @@ jobs:
   macos:
     name: macos (clang)
     runs-on: macos-latest
+    # A hung step (seen: apt-get for 6 h) fails here instead of
+    # running into GitHub's 6-hour limit.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
