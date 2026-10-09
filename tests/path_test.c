@@ -70,7 +70,7 @@ static const char *components_of(string_t p)
             (int)part.len,
             part.ptr ? part.ptr : "");
     }
-    iter_drop(&it);
+    iter_destroy(&it);
     return out;
 }
 
@@ -215,7 +215,7 @@ TEST(components_iterator_has_string_elements)
 {
     iter_t it = path_components(P("/a"), A);
     ASSERT_EQ(sizeof(string_t), it.elem_size);
-    iter_drop(&it);
+    iter_destroy(&it);
 }
 
 /* components and join_iter are inverses. */
