@@ -7,3 +7,4 @@ function(filec_test name)
 endfunction()
 
 filec_test(smoke)
+filec_test(path)
