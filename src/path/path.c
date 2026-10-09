@@ -6,7 +6,6 @@
 #include "filec/path.h"
 #include "seqc/string.h"
 #include "seqc/vec.h"
-#include <bits/types/stack_t.h>
 
 static bool next_component(string_t *rest, string_t *part)
 {
