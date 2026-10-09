@@ -95,6 +95,13 @@ CMake ≥ 3.20 and Ninja. Dependencies are fetched at configure time.
 The `asan` and `tsan` presets use clang. `test.sh` also fails if `malloc`/`free`
 appear in `src/` — memory comes from the caller's `allocator_t`.
 
+### Debugging tests in VS Code
+
+Install the [CodeLLDB extension](https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb),
+then select **Debug path tests (LLDB)** or **Debug smoke tests (LLDB)** in
+Run and Debug and press F5. Each configuration builds its test with the CMake
+`debug` preset before launching it, so breakpoints in `tests/` are available.
+
 Use from another project:
 
 ```cmake
