@@ -146,7 +146,7 @@ iter_t path_components(string_t p, allocator_t a)
 
     return (iter_t){
         .state = state,
-        .drop = split_drop,
+        .destroy = split_drop,
         .next = split_next,
         .allocator = a,
         .elem_size = sizeof(string_t)};
@@ -169,7 +169,7 @@ string_t path_join(string_t a, string_t b, allocator_t alloc)
     {
         if (strbuf_append(buf, b) != SEQC_OK)
         {
-            strbuf_free(buf);
+            strbuf_destroy(buf);
             return (string_t){NULL, 0};
         }
     }
@@ -177,26 +177,26 @@ string_t path_join(string_t a, string_t b, allocator_t alloc)
     {
         if (strbuf_append(buf, a) != SEQC_OK)
         {
-            strbuf_free(buf);
+            strbuf_destroy(buf);
             return (string_t){NULL, 0};
         }
         if (strbuf_len(buf) > 0)
         {
             if (strbuf_append(buf, STRING_LIT("/")) != SEQC_OK)
             {
-                strbuf_free(buf);
+                strbuf_destroy(buf);
                 return (string_t){NULL, 0};
             }
         }
         if (strbuf_append(buf, b) != SEQC_OK)
         {
-            strbuf_free(buf);
+            strbuf_destroy(buf);
             return (string_t){NULL, 0};
         }
     }
 
     string_t result = path_normalize(strbuf_finish(buf), alloc);
-    strbuf_free(buf);
+    strbuf_destroy(buf);
     return result;
 }
 /* Joins every string_t yielded by parts, left to right, as path_join.
@@ -206,7 +206,7 @@ string_t path_join_iter(iter_t parts, allocator_t alloc)
     strbuf_t *buf = strbuf_create(alloc);
     if (buf == NULL)
     {
-        iter_drop(&parts);
+        iter_destroy(&parts);
         return (string_t){NULL, 0};
     }
 
@@ -219,8 +219,8 @@ string_t path_join_iter(iter_t parts, allocator_t alloc)
             strbuf_clear(buf);
             if (strbuf_append(buf, part) != SEQC_OK)
             {
-                strbuf_free(buf);
-                iter_drop(&parts);
+                strbuf_destroy(buf);
+                iter_destroy(&parts);
                 return (string_t){NULL, 0};
             }
             continue;
@@ -229,22 +229,22 @@ string_t path_join_iter(iter_t parts, allocator_t alloc)
         {
             if (strbuf_append(buf, STRING_LIT("/")) != SEQC_OK)
             {
-                strbuf_free(buf);
-                iter_drop(&parts);
+                strbuf_destroy(buf);
+                iter_destroy(&parts);
                 return (string_t){NULL, 0};
             }
         }
         if (strbuf_append(buf, part) != SEQC_OK)
         {
-            strbuf_free(buf);
-            iter_drop(&parts);
+            strbuf_destroy(buf);
+            iter_destroy(&parts);
             return (string_t){NULL, 0};
         }
     }
-    iter_drop(&parts);
+    iter_destroy(&parts);
 
     string_t result = path_normalize(strbuf_finish(buf), alloc);
-    strbuf_free(buf);
+    strbuf_destroy(buf);
     return result;
 }
 
@@ -279,12 +279,13 @@ string_t path_normalize(string_t p, allocator_t alloc)
             bool top_is_dotdot =
                 n > 0
                 && string_equals(
-                    *(string_t *)vec_get(components, n - 1), STRING_LIT(".."));
+                    *(string_t *)vec_get_ptr(components, n - 1),
+                    STRING_LIT(".."));
             if (n > 0 && !top_is_dotdot)
             {
                 if (vec_pop(components, 0) != SEQC_OK)
                 {
-                    vec_free(components);
+                    vec_destroy(components);
                     return (string_t){NULL, 0};
                 }
             }
@@ -292,7 +293,7 @@ string_t path_normalize(string_t p, allocator_t alloc)
             {
                 if (vec_push(components, &tok) != SEQC_OK)
                 {
-                    vec_free(components);
+                    vec_destroy(components);
                     return (string_t){NULL, 0};
                 }
             }
@@ -300,7 +301,7 @@ string_t path_normalize(string_t p, allocator_t alloc)
         }
         if (vec_push(components, &tok) != SEQC_OK)
         {
-            vec_free(components);
+            vec_destroy(components);
             return (string_t){NULL, 0};
         }
     }
@@ -308,7 +309,7 @@ string_t path_normalize(string_t p, allocator_t alloc)
     strbuf_t *buf = strbuf_create(alloc);
     if (buf == NULL)
     {
-        vec_free(components);
+        vec_destroy(components);
         return (string_t){NULL, 0};
     }
 
@@ -320,9 +321,9 @@ string_t path_normalize(string_t p, allocator_t alloc)
     for (size_t i = 0; i < vec_len(components); i++)
     {
         string_t comp;
-        if (vec_get_copy(components, i, &comp) != SEQC_OK)
+        if (vec_get(components, i, &comp) != SEQC_OK)
         {
-            vec_free(components);
+            vec_destroy(components);
             return (string_t){NULL, 0};
         }
         if (i > 0)
@@ -331,14 +332,14 @@ string_t path_normalize(string_t p, allocator_t alloc)
         }
         strbuf_append(buf, comp);
     }
-    vec_free(components);
+    vec_destroy(components);
     if (strbuf_len(buf) == 0)
     {
         strbuf_append(buf, STRING_LIT("."));
     }
 
     string_t result = string_copy(strbuf_finish(buf), alloc);
-    strbuf_free(buf);
+    strbuf_destroy(buf);
     return result;
 }
 
@@ -365,24 +366,24 @@ string_t path_with_extension(string_t p, string_t ext, allocator_t alloc)
         }
         if (strbuf_append(buf, (string_t){p.ptr, keep}) != SEQC_OK)
         {
-            strbuf_free(buf);
+            strbuf_destroy(buf);
             return (string_t){NULL, 0};
         }
         if (ext.ptr[0] != '.')
         {
             if (strbuf_append(buf, STRING_LIT(".")) != SEQC_OK)
             {
-                strbuf_free(buf);
+                strbuf_destroy(buf);
                 return (string_t){NULL, 0};
             }
         }
         if (strbuf_append(buf, ext) != SEQC_OK)
         {
-            strbuf_free(buf);
+            strbuf_destroy(buf);
             return (string_t){NULL, 0};
         }
         string_t result = string_copy(strbuf_finish(buf), alloc);
-        strbuf_free(buf);
+        strbuf_destroy(buf);
         return result;
     }
     return string_copy((string_t){p.ptr, keep}, alloc);
@@ -464,11 +465,11 @@ string_t path_relative(
     }
 
     string_t result = string_copy(strbuf_finish(buf), alloc);
-    strbuf_free(buf);
+    strbuf_destroy(buf);
     return result;
 
 oom:
-    strbuf_free(buf);
+    strbuf_destroy(buf);
     return (string_t){NULL, 0};
 }
 
