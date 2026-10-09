@@ -1,20 +1,36 @@
 #pragma once
-/* filec/path — lexical path manipulation.  No syscalls, no filesystem access:
- * "/a/b/../c" normalises to "/a/c" even if b is a symlink.  Use fs_ functions
- * when the real filesystem matters.
+/* filec/path — lexical manipulation of CANONICAL paths.  No syscalls, no
+ * filesystem access, no platform: "/a/b/../c" normalises to "/a/c" even if
+ * b is a symlink.  Use the fs_ functions when the real filesystem matters.
  *
  * STATUS: DRAFT INTERFACE — not implemented yet.  See docs/interface.md.
  *
- * Canonical form: '/' separators on every platform.  Windows-style input
- * ('\\', "C:\\x", "\\\\server\\share", "\\\\?\\C:\\x") is accepted under
- * PATH_WINDOWS and comes out with '/'.  Convert to the native look only for
- * display (path_to_display) — fs_ functions convert at the OS boundary.
+ * The canonical form — one syntax on every platform:
  *
- * Every path function takes a style, so Windows rules are testable on Linux
- * and vice versa.  Use PATH_NATIVE in application code.
+ *   - '/' is the only separator.
+ *   - A path is absolute exactly when it starts with '/'; the only root is
+ *     "/".  Everything else is relative.
+ *   - Windows drives and shares are ordinary first components:
  *
- * Results marked "view" point into the input: no allocation, valid as long
- * as the input is.  Allocating functions return {NULL, 0} on OOM. */
+ *         C:\Users\me          ->  /C:/Users/me
+ *         \\server\share\x     ->  /UNC/server/share/x
+ *
+ *     so on Windows "/" is a virtual root whose children are the drives.
+ *
+ * Getting there is not this module's job: filec/native.h converts between
+ * native and canonical paths, and fs_ functions take and return canonical
+ * paths.  So this module never sees '\', "C:" roots or "\\?\" prefixes.
+ *
+ * NORMALISED paths have no empty components ("//"), no "." components, no
+ * ".." except leading ones in a relative path, and no trailing '/' (except
+ * the root "/").  The empty relative path is ".".  Everything filec hands
+ * out is normalised; the functions below expect normalised input unless
+ * they say otherwise (path_normalize and path_join accept anything).
+ *
+ * Results marked "view" point into the input (or are string literals): no
+ * allocation, valid as long as the input is.  Allocating functions always
+ * return memory from the allocator you pass, normalised, and {NULL, 0} on
+ * OOM. */
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -23,75 +39,91 @@
 #include "seqc/iter.h"
 #include "seqc/string.h"
 
+/* How components compare.  Paths themselves are platform-neutral; whether
+ * "A" and "a" name the same file is not, so comparisons ask. */
 typedef enum
 {
-    PATH_POSIX,   /* '/' only, case-sensitive, root is "/"                 */
-    PATH_WINDOWS, /* '/' and '\\', ASCII case-insensitive, drive/UNC roots */
-} path_style_t;
+    PATH_CASE_SENSITIVE,   /* byte for byte (Linux)                       */
+    PATH_CASE_INSENSITIVE, /* ASCII letters folded (Windows, macOS default) */
+} path_case_t;
 
-#ifdef _WIN32
-#define PATH_NATIVE PATH_WINDOWS
+#if defined(_WIN32) || defined(__APPLE__)
+#define PATH_CASE_NATIVE PATH_CASE_INSENSITIVE
 #else
-#define PATH_NATIVE PATH_POSIX
+#define PATH_CASE_NATIVE PATH_CASE_SENSITIVE
 #endif
 
 /* --- Anatomy (views) ----------------------------------------------------- */
 /*
- *   path             root            parent          file_name  stem     ext
- *   "/a/b.tar.gz"    "/"             "/a"            "b.tar.gz" "b.tar"  "gz"
- *   "C:/x/.bashrc"   "C:/"           "C:/x"          ".bashrc"  ".bashrc" ""
- *   "//srv/share/f"  "//srv/share/"  "//srv/share/"  "f"        "f"      ""
- *   "a"              ""              ""              "a"        "a"      ""
- *   "/"              "/"             "/"             ""         ""       ""
+ *   path               parent      file_name   stem        extension
+ *   "/a/b.tar.gz"      "/a"        "b.tar.gz"  "b.tar"     "gz"
+ *   "/x/.bashrc"       "/x"        ".bashrc"   ".bashrc"   ""
+ *   "/C:/Users"        "/C:"       "Users"     "Users"     ""
+ *   "/C:"              "/"         "C:"        "C:"        ""
+ *   "/"                "/"         ""          ""          ""
+ *   "a/b"              "a"         "b"         "b"         ""
+ *   "a"                "."         "a"         "a"         ""
+ *   "."                "."         ""          ""          ""
  */
 
-string_t path_root(string_t p, path_style_t style); /* "" if relative */
-bool path_is_absolute(string_t p, path_style_t style);
-/* Parent of a root is the root. */
-string_t path_parent(string_t p, path_style_t style);
-/* Last component, "" for a root. */
-string_t path_file_name(string_t p, path_style_t style);
-string_t path_stem(string_t p, path_style_t style);
-/* Without the dot. */
-string_t path_extension(string_t p, path_style_t style);
+bool path_is_absolute(string_t p);
 
-/* Yields string_t: the root first (if any), then each component.
- * Empty components and "." are skipped; ".." is yielded as-is. */
-iter_t path_components(string_t p, path_style_t style, allocator_t a);
+/* p without its last component.  The parent of "/" is "/"; of a single
+ * relative component (and of ".") it is ".".  Purely lexical: the parent
+ * of ".." is ".", even though the real parent is "../..". */
+string_t path_parent(string_t p);
 
-/* --- Building (allocating) ----------------------------------------------- */
+/* The last component; "" for "/" and ".". */
+string_t path_file_name(string_t p);
 
-/* join("/a", "b") = "/a/b";  join("/a", "/b") = "/b" (absolute b wins). */
-string_t path_join(
-    string_t a, string_t b, path_style_t style, allocator_t alloc);
+/* file_name without its extension. */
+string_t path_stem(string_t p);
 
-/* Joins every string_t yielded by parts.  Consumes the iterator. */
-string_t path_join_iter(iter_t parts, path_style_t style, allocator_t alloc);
+/* What follows the last '.' of file_name, without the dot.  "" when there
+ * is no dot, when the only dot is the first character (".bashrc"), or when
+ * the name ends in a dot ("a."). */
+string_t path_extension(string_t p);
 
-/* Canonical separators, no empty or "." components, ".." resolved
- * lexically.  ".." never climbs above a root; leading ".." of a relative
- * path is kept.  Trailing separator removed except on a root.  "" -> "." */
-string_t path_normalize(string_t p, path_style_t style, allocator_t alloc);
+/* Yields string_t: "/" first if p is absolute, then each component.
+ * "." yields nothing.  path_join_iter(path_components(p)) gives p back. */
+iter_t path_components(string_t p, allocator_t a);
 
-/* Replace (or add, or with ext = "" remove) the extension. */
-string_t path_with_extension(
-    string_t p, string_t ext, path_style_t style, allocator_t alloc);
+/* --- Building (allocating, normalised results) --------------------------- */
 
-/* Relative path from base to target, both absolute and normalised, e.g.
- * ("/a/b", "/a/c/d") -> "../c/d".  Returns {NULL, 0} if the roots differ. */
+/* a, then b.  An absolute b replaces a.  Accepts unnormalised input:
+ *   join("/a", "b") = "/a/b"     join("/a/b", "../c") = "/a/c"
+ *   join("/a", "/b") = "/b"      join("/a", "") = "/a" */
+string_t path_join(string_t a, string_t b, allocator_t alloc);
+
+/* Joins every string_t yielded by parts, left to right, as path_join.
+ * Consumes the iterator.  No parts gives ".". */
+string_t path_join_iter(iter_t parts, allocator_t alloc);
+
+/* The normalised form of any canonical path: empty and "." components
+ * dropped, ".." resolved lexically.  ".." never climbs above "/"; a
+ * relative path keeps its leading ".."s.  "" -> "."
+ *   "/a//./b/../c/" -> "/a/c"      "a/../.." -> ".."      "/.." -> "/" */
+string_t path_normalize(string_t p, allocator_t alloc);
+
+/* p with its extension replaced (or added, or with ext = "" removed). */
+string_t path_with_extension(string_t p, string_t ext, allocator_t alloc);
+
+/* The relative path that leads from base to target, both absolute:
+ *   ("/a/b", "/a/c/d") -> "../c/d"     ("/a", "/a") -> "."
+ * Every absolute path shares the root "/", so there is always an answer —
+ * on Windows it may lead through the virtual root ("../../D:/x"), which has
+ * no native form.  Returns {NULL, 0} if base or target is relative. */
 string_t path_relative(
-    string_t base, string_t target, path_style_t style, allocator_t alloc);
+    string_t base, string_t target, path_case_t cs, allocator_t alloc);
 
-/* Native look for showing to a user: '\\' on Windows, unchanged on POSIX. */
-string_t path_to_display(string_t p, path_style_t style, allocator_t alloc);
+/* --- Comparing -------------------------------------------------------------
+ */
+/* Component by component, so "/foo" is not a prefix of "/foobar", and a
+ * directory sorts directly before its contents: "/a" < "/a/b" < "/a-b". */
 
-/* --- Comparing ----------------------------------------------------------- */
-/* Component-wise on normalised input: "/foo" is not a prefix of "/foobar".
- * PATH_WINDOWS folds ASCII case only (NTFS's full upcase table is not
- * modelled; neither is macOS Unicode normalisation). */
+bool path_equals(string_t a, string_t b, path_case_t cs);
+int path_compare(string_t a, string_t b, path_case_t cs);
+bool path_starts_with(string_t p, string_t prefix, path_case_t cs);
 
-bool path_equals(string_t a, string_t b, path_style_t style);
-int path_compare(string_t a, string_t b, path_style_t style);
-bool path_starts_with(string_t p, string_t prefix, path_style_t style);
-/* Consistent with path_equals: equal paths hash equal. */
-size_t path_hash(string_t p, path_style_t style);
+/* Consistent with path_equals for the same cs: equal paths hash equal. */
+size_t path_hash(string_t p, path_case_t cs);

@@ -1,0 +1,19 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build path_test (debug)",
+            "type": "shell",
+            "command": "cmake",
+            "args": ["--build", "--preset", "debug", "--target", "path_test"],
+            "problemMatcher": []
+        },
+        {
+            "label": "Build smoke_test (debug)",
+            "type": "shell",
+            "command": "cmake",
+            "args": ["--build", "--preset", "debug", "--target", "smoke_test"],
+            "problemMatcher": []
+        }
+    ]
+}

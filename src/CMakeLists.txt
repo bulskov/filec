@@ -1,9 +1,10 @@
 add_library(filec STATIC)
 add_library(filec::filec ALIAS filec)
 
-# path is pure string logic — the same file on every platform.
+# path and native are pure string logic — the same files on every platform.
 target_sources(filec PRIVATE
     path/path.c
+    path/native.c
 )
 
 # One fs backend per platform.

@@ -4,6 +4,7 @@
 
 #include "ctt.h"
 #include "filec/fs.h"
+#include "filec/native.h"
 #include "filec/path.h"
 #include "filec/version.h"
 
