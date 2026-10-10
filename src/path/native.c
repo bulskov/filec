@@ -33,7 +33,7 @@ static string_t take_name(string_t *s, bool *had_sep)
     string_t name = {s->ptr, n};
     *had_sep = n < s->len;
     size_t skip = *had_sep ? n + 1 : n; /* past the separator, if any */
-    *s = (string_t){s->ptr + skip, s->len - skip};
+    *s = string_slice(*s, skip, s->len); /* {NULL, 0} stays {NULL, 0} */
     return name;
 }
 
