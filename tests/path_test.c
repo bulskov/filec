@@ -13,6 +13,8 @@
 
 #include "arena/growing_arena.h"
 
+#include "heap_allocator.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -493,38 +495,7 @@ TEST(allocating_functions_report_oom)
  * already freed, and temporary memory the function forgets to free.  With
  * a malloc-based allocator both become visible under ./test.sh asan:
  * AddressSanitizer reports heap-use-after-free, LeakSanitizer reports
- * leaks. */
-
-static void *heap_alloc(void *ctx, size_t size, size_t align)
-{
-    (void)ctx;
-    (void)align; /* malloc aligns for every type the path code allocates */
-    return malloc(size);
-}
-
-static void *heap_realloc(
-    void *ctx, void *ptr, size_t old_size, size_t new_size, size_t align)
-{
-    (void)ctx;
-    (void)old_size;
-    (void)align;
-    return realloc(ptr, new_size);
-}
-
-static void heap_free(void *ctx, void *ptr, size_t size)
-{
-    (void)ctx;
-    (void)size;
-    free(ptr);
-}
-
-static const allocator_vtable_t heap_vtable = {
-    heap_alloc, heap_realloc, heap_free};
-
-static allocator_t heap(void)
-{
-    return (allocator_t){&heap_vtable, NULL};
-}
+ * leaks.  heap() comes from heap_allocator.h. */
 
 /* Every allocating function returns one plain allocation of exactly the
  * result — the caller frees it with mem_free(alloc, ptr, len) — and frees
