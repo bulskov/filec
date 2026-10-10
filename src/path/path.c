@@ -1,11 +1,10 @@
 /* filec/path — lexical manipulation of canonical paths.  No OS code and no
- * platform: the same file, and the same tests, everywhere.
- *
- */
+ * platform: the same file, and the same tests, everywhere. */
 
 #include "filec/path.h"
+
+#include "names.h"
 #include "seqc/string.h"
-#include "seqc/vec.h"
 
 static bool next_component(string_t *rest, string_t *part)
 {
@@ -152,267 +151,125 @@ iter_t path_components(string_t p, allocator_t a)
         .elem_size = sizeof(string_t)};
 }
 
-/* --- Building (allocating, normalised results) --------------------------- */
+/* --- Building (append to out, normalised results) ----------------------- */
+/* Every function saves mark = strbuf_len(out) on entry, appends, and on any
+ * failure truncates back to mark.  The normalising is filec_append_names
+ * (names.h), with mark as the floor. */
 
-/* a, then b.  An absolute b replaces a.  Accepts unnormalised input:
- *   join("/a", "b") = "/a/b"     join("/a/b", "../c") = "/a/c"
- *   join("/a", "/b") = "/b"      join("/a", "") = "/a" */
-string_t path_join(string_t a, string_t b, allocator_t alloc)
+/* Undoes everything appended since mark. */
+static path_err_t fail(strbuf_t *out, size_t mark)
 {
-    strbuf_t *buf = strbuf_create(alloc);
-    if (buf == NULL)
-    {
-        return (string_t){NULL, 0};
-    }
+    strbuf_truncate(out, mark);
+    return PATH_OOM;
+}
 
+path_err_t path_normalize(string_t p, strbuf_t *out)
+{
+    if (!out)
+    {
+        return PATH_INVALID;
+    }
+    size_t mark = strbuf_len(out);
+    bool absolute = path_is_absolute(p);
+    if (filec_append_names(out, p, false, mark, absolute) != SEQC_OK
+        || filec_finish_names(out, mark, absolute) != SEQC_OK)
+    {
+        return fail(out, mark);
+    }
+    return PATH_OK;
+}
+
+path_err_t path_join(string_t a, string_t b, strbuf_t *out)
+{
+    if (!out)
+    {
+        return PATH_INVALID;
+    }
     if (path_is_absolute(b))
     {
-        if (strbuf_append(buf, b) != SEQC_OK)
-        {
-            strbuf_destroy(buf);
-            return (string_t){NULL, 0};
-        }
+        return path_normalize(b, out); /* an absolute b replaces a */
     }
-    else
+    size_t mark = strbuf_len(out);
+    bool absolute = path_is_absolute(a);
+    if (filec_append_names(out, a, false, mark, absolute) != SEQC_OK
+        || filec_append_names(out, b, false, mark, absolute) != SEQC_OK
+        || filec_finish_names(out, mark, absolute) != SEQC_OK)
     {
-        if (strbuf_append(buf, a) != SEQC_OK)
-        {
-            strbuf_destroy(buf);
-            return (string_t){NULL, 0};
-        }
-        if (strbuf_len(buf) > 0)
-        {
-            if (strbuf_append(buf, STRING_LIT("/")) != SEQC_OK)
-            {
-                strbuf_destroy(buf);
-                return (string_t){NULL, 0};
-            }
-        }
-        if (strbuf_append(buf, b) != SEQC_OK)
-        {
-            strbuf_destroy(buf);
-            return (string_t){NULL, 0};
-        }
+        return fail(out, mark);
     }
-
-    string_t result = path_normalize(strbuf_view(buf), alloc);
-    strbuf_destroy(buf);
-    return result;
+    return PATH_OK;
 }
-/* Joins every string_t yielded by parts, left to right, as path_join.
- * Consumes the iterator.  No parts gives ".". */
-string_t path_join_iter(iter_t parts, allocator_t alloc)
+
+path_err_t path_join_iter(iter_t parts, strbuf_t *out)
 {
-    strbuf_t *buf = strbuf_create(alloc);
-    if (buf == NULL)
+    if (!out)
     {
         iter_destroy(&parts);
-        return (string_t){NULL, 0};
+        return PATH_INVALID;
     }
-
-    string_t part = {NULL, 0};
-
-    while (parts.next(&parts, &part))
+    size_t mark = strbuf_len(out);
+    bool absolute = false;
+    seqc_status_t st = SEQC_OK;
+    string_t part;
+    while (st == SEQC_OK && parts.next(&parts, &part))
     {
         if (path_is_absolute(part))
         {
-            strbuf_clear(buf);
-            if (strbuf_append(buf, part) != SEQC_OK)
-            {
-                strbuf_destroy(buf);
-                iter_destroy(&parts);
-                return (string_t){NULL, 0};
-            }
-            continue;
+            strbuf_truncate(out, mark); /* an absolute part replaces all */
+            absolute = true;
         }
-        if (strbuf_len(buf) > 0)
-        {
-            if (strbuf_append(buf, STRING_LIT("/")) != SEQC_OK)
-            {
-                strbuf_destroy(buf);
-                iter_destroy(&parts);
-                return (string_t){NULL, 0};
-            }
-        }
-        if (strbuf_append(buf, part) != SEQC_OK)
-        {
-            strbuf_destroy(buf);
-            iter_destroy(&parts);
-            return (string_t){NULL, 0};
-        }
+        st = filec_append_names(out, part, false, mark, absolute);
     }
     iter_destroy(&parts);
-
-    string_t result = path_normalize(strbuf_view(buf), alloc);
-    strbuf_destroy(buf);
-    return result;
+    if (st != SEQC_OK || filec_finish_names(out, mark, absolute) != SEQC_OK)
+    {
+        return fail(out, mark);
+    }
+    return PATH_OK;
 }
 
-/* The normalised form of any canonical path: empty and "." components
- * dropped, ".." resolved lexically.  ".." never climbs above "/"; a
- * relative path keeps its leading ".."s.  "" -> "."
- *   "/a//./b/../c/" -> "/a/c"      "a/../.." -> ".."      "/.." -> "/" */
-string_t path_normalize(string_t p, allocator_t alloc)
+path_err_t path_with_extension(string_t p, string_t ext, strbuf_t *out)
 {
-    vec_t *components = vec_create(sizeof(string_t), alloc);
-    if (components == 0)
-    {
-        return (string_t){NULL, 0};
-    }
-
-    string_t rest = p;
-    string_t tok = {NULL, 0};
-    bool absolute = path_is_absolute(p);
-    while (string_split_next(&rest, '/', &tok))
-    {
-        if (tok.len == 0)
-        {
-            continue;
-        }
-        if (string_equals(tok, STRING_LIT(".")))
-        {
-            continue;
-        }
-        if (string_equals(tok, STRING_LIT("..")))
-        {
-            size_t n = vec_len(components);
-            bool top_is_dotdot =
-                n > 0
-                && string_equals(
-                    *(string_t *)vec_get_ptr(components, n - 1),
-                    STRING_LIT(".."));
-            if (n > 0 && !top_is_dotdot)
-            {
-                if (vec_pop(components, 0) != SEQC_OK)
-                {
-                    vec_destroy(components);
-                    return (string_t){NULL, 0};
-                }
-            }
-            else if (!absolute)
-            {
-                if (vec_push(components, &tok) != SEQC_OK)
-                {
-                    vec_destroy(components);
-                    return (string_t){NULL, 0};
-                }
-            }
-            continue;
-        }
-        if (vec_push(components, &tok) != SEQC_OK)
-        {
-            vec_destroy(components);
-            return (string_t){NULL, 0};
-        }
-    }
-
-    strbuf_t *buf = strbuf_create(alloc);
-    if (buf == NULL)
-    {
-        vec_destroy(components);
-        return (string_t){NULL, 0};
-    }
-
-    if (absolute)
-    {
-        strbuf_append_char(buf, '/');
-    }
-
-    for (size_t i = 0; i < vec_len(components); i++)
-    {
-        string_t comp;
-        if (vec_get(components, i, &comp) != SEQC_OK)
-        {
-            vec_destroy(components);
-            return (string_t){NULL, 0};
-        }
-        if (i > 0)
-        {
-            strbuf_append_char(buf, '/');
-        }
-        strbuf_append(buf, comp);
-    }
-    vec_destroy(components);
-    if (strbuf_len(buf) == 0)
-    {
-        strbuf_append(buf, STRING_LIT("."));
-    }
-
-    string_t result = strbuf_to_string(buf, alloc);
-    strbuf_destroy(buf);
-    return result;
-}
-
-/* p with its extension replaced (or added, or with ext = "" removed). */
-string_t path_with_extension(string_t p, string_t ext, allocator_t alloc)
-{
-    if (p.len == 0)
-    {
-        return (string_t){NULL, 0};
-    }
-
     string_t stem = path_stem(p);
-    if (stem.len == 0)
+    if (!out || stem.len == 0)
     {
-        return (string_t){0, 0};
+        return PATH_INVALID; /* no file name to give an extension: "/", "." */
     }
+    size_t mark = strbuf_len(out);
     size_t keep = (size_t)(stem.ptr - p.ptr) + stem.len;
+    if (strbuf_append(out, (string_t){p.ptr, keep}) != SEQC_OK)
+    {
+        return fail(out, mark);
+    }
     if (ext.len > 0)
     {
-        strbuf_t *buf = strbuf_create(alloc);
-        if (buf == NULL)
+        if ((ext.ptr[0] != '.' && strbuf_append_char(out, '.') != SEQC_OK)
+            || strbuf_append(out, ext) != SEQC_OK)
         {
-            return (string_t){NULL, 0};
+            return fail(out, mark);
         }
-        if (strbuf_append(buf, (string_t){p.ptr, keep}) != SEQC_OK)
-        {
-            strbuf_destroy(buf);
-            return (string_t){NULL, 0};
-        }
-        if (ext.ptr[0] != '.')
-        {
-            if (strbuf_append(buf, STRING_LIT(".")) != SEQC_OK)
-            {
-                strbuf_destroy(buf);
-                return (string_t){NULL, 0};
-            }
-        }
-        if (strbuf_append(buf, ext) != SEQC_OK)
-        {
-            strbuf_destroy(buf);
-            return (string_t){NULL, 0};
-        }
-        string_t result = strbuf_to_string(buf, alloc);
-        strbuf_destroy(buf);
-        return result;
     }
-    return string_copy((string_t){p.ptr, keep}, alloc);
+    return PATH_OK;
 }
 
-/* The relative path that leads from base to target, both absolute:
- *   ("/a/b", "/a/c/d") -> "../c/d"     ("/a", "/a") -> "."
- * Every absolute path shares the root "/", so there is always an answer —
- * on Windows it may lead through the virtual root ("../../D:/x"), which has
- * no native form.  Returns {NULL, 0} if base or target is relative. */
-string_t path_relative(
-    string_t base, string_t target, path_case_t cs, allocator_t alloc)
+path_err_t path_relative(
+    string_t base, string_t target, path_case_t cs, strbuf_t *out)
 {
-    if (!path_is_absolute(base) || !path_is_absolute(target))
+    if (!out || !path_is_absolute(base) || !path_is_absolute(target))
     {
-        return (string_t){NULL, 0};
+        return PATH_INVALID;
     }
 
-    string_t base_copy = base;
-    string_t target_copy = target;
+    string_t base_rest = base;
+    string_t target_rest = target;
     string_t base_tok = {NULL, 0};
     string_t target_tok = {NULL, 0};
     bool more_base = false;
     bool more_target = false;
-
     for (;;)
     {
-        more_base = next_component(&base_copy, &base_tok);
-        more_target = next_component(&target_copy, &target_tok);
+        more_base = next_component(&base_rest, &base_tok);
+        more_target = next_component(&target_rest, &target_tok);
         if (!more_base || !more_target
             || !path_equals(base_tok, target_tok, cs))
         {
@@ -420,11 +277,7 @@ string_t path_relative(
         }
     }
 
-    strbuf_t *buf = strbuf_create(alloc);
-    if (buf == NULL)
-    {
-        return (string_t){NULL, 0};
-    }
+    size_t mark = strbuf_len(out);
 
     /* Up: one ".." for the first base component past the common part, and
      * one for each base component after it. */
@@ -432,15 +285,13 @@ string_t path_relative(
     {
         do
         {
-            if (strbuf_len(buf) > 0 && strbuf_append_char(buf, '/') != SEQC_OK)
+            if ((strbuf_len(out) > mark
+                 && strbuf_append_char(out, '/') != SEQC_OK)
+                || strbuf_append(out, STRING_LIT("..")) != SEQC_OK)
             {
-                goto oom;
+                return fail(out, mark);
             }
-            if (strbuf_append(buf, STRING_LIT("..")) != SEQC_OK)
-            {
-                goto oom;
-            }
-        } while (next_component(&base_copy, &base_tok));
+        } while (next_component(&base_rest, &base_tok));
     }
 
     /* Down: the rest of target from its first component past the common
@@ -449,28 +300,18 @@ string_t path_relative(
     {
         string_t down = {
             target_tok.ptr, (size_t)(target.ptr + target.len - target_tok.ptr)};
-        if (strbuf_len(buf) > 0 && strbuf_append_char(buf, '/') != SEQC_OK)
+        if ((strbuf_len(out) > mark && strbuf_append_char(out, '/') != SEQC_OK)
+            || strbuf_append(out, down) != SEQC_OK)
         {
-            goto oom;
-        }
-        if (strbuf_append(buf, down) != SEQC_OK)
-        {
-            goto oom;
+            return fail(out, mark);
         }
     }
 
-    if (strbuf_len(buf) == 0 && strbuf_append_char(buf, '.') != SEQC_OK)
+    if (filec_finish_names(out, mark, false) != SEQC_OK)
     {
-        goto oom;
+        return fail(out, mark);
     }
-
-    string_t result = strbuf_to_string(buf, alloc);
-    strbuf_destroy(buf);
-    return result;
-
-oom:
-    strbuf_destroy(buf);
-    return (string_t){NULL, 0};
+    return PATH_OK;
 }
 
 /* --- Comparing -------------------------------------------------------------

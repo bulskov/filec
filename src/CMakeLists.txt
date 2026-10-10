@@ -5,6 +5,7 @@ add_library(filec::filec ALIAS filec)
 target_sources(filec PRIVATE
     path/path.c
     path/native.c
+    path/names.c
 )
 
 # One fs backend per platform.

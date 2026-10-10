@@ -7,6 +7,8 @@
  * out back to the length it had on entry. */
 
 #include "filec/native.h"
+
+#include "names.h"
 #include "seqc/status.h"
 #include "seqc/string.h"
 
@@ -14,11 +16,6 @@
 static bool is_sep(char ch)
 {
     return ch == '\\' || ch == '/';
-}
-
-static bool is_sep_in(char ch, path_style_t style)
-{
-    return style == PATH_STYLE_WINDOWS ? is_sep(ch) : ch == '/';
 }
 
 /* The name at the start of *s (up to the next separator or the end), and
@@ -32,7 +29,7 @@ static string_t take_name(string_t *s, bool *had_sep)
     }
     string_t name = {s->ptr, n};
     *had_sep = n < s->len;
-    size_t skip = *had_sep ? n + 1 : n; /* past the separator, if any */
+    size_t skip = *had_sep ? n + 1 : n;  /* past the separator, if any */
     *s = string_slice(*s, skip, s->len); /* {NULL, 0} stays {NULL, 0} */
     return name;
 }
@@ -179,80 +176,6 @@ static path_native_err_t take_root(string_t *s, win_root_t *root)
     return PATH_NATIVE_OK;
 }
 
-/* Removes the last name appended after floor — "a/b" -> "a", "/C:/x" ->
- * "/C:" — and returns true; false when there is none, or (relative) when it
- * is a ".." that must stay. */
-static bool drop_last_name(strbuf_t *out, size_t floor)
-{
-    string_t v = strbuf_view(out);
-    if (v.len == floor)
-    {
-        return false;
-    }
-    size_t start = v.len; /* start of the last name */
-    while (start > floor && v.ptr[start - 1] != '/')
-    {
-        start--;
-    }
-    string_t last = string_slice(v, start, v.len);
-    if (string_equals(last, STRING_LIT("..")))
-    {
-        return false;
-    }
-    /* cut the name and the '/' before it — but never the floor itself */
-    strbuf_truncate(out, start > floor ? start - 1 : floor);
-    return true;
-}
-
-/* Appends the names of rest to out, normalised: empty names and "." are
- * dropped, ".." removes the name before it.  floor is where the names start
- * (the end of the root).  With absolute, every name is written as "/name"
- * and ".." stops at the floor; without, names are joined by '/' and leading
- * ".." stay. */
-static seqc_status_t append_names(
-    strbuf_t *out,
-    string_t rest,
-    path_style_t style,
-    size_t floor,
-    bool absolute)
-{
-    size_t i = 0;
-    while (i <= rest.len)
-    {
-        size_t j = i;
-        while (j < rest.len && !is_sep_in(rest.ptr[j], style))
-        {
-            j++;
-        }
-        string_t name = string_slice(rest, i, j);
-        i = j + 1;
-
-        if (name.len == 0 || string_equals(name, STRING_LIT(".")))
-        {
-            continue;
-        }
-        if (string_equals(name, STRING_LIT("..")))
-        {
-            if (drop_last_name(out, floor) || absolute)
-            {
-                continue; /* removed a name, or stopped at the root */
-            }
-        }
-        if (absolute || strbuf_len(out) > floor)
-        {
-            if (strbuf_append_char(out, '/') != SEQC_OK)
-            {
-                return SEQC_OOM;
-            }
-        }
-        if (strbuf_append(out, name) != SEQC_OK)
-        {
-            return SEQC_OOM;
-        }
-    }
-    return SEQC_OK;
-}
-
 /* Undoes everything appended since mark and returns err. */
 static path_native_err_t fail(strbuf_t *out, size_t mark, path_native_err_t err)
 {
@@ -290,20 +213,17 @@ path_native_err_t path_from_native(
     }
 
     size_t floor = strbuf_len(out);
-    if (append_names(out, native, style, floor, absolute) != SEQC_OK)
+    bool windows = style == PATH_STYLE_WINDOWS;
+    if (filec_append_names(out, native, windows, floor, absolute) != SEQC_OK)
     {
         return fail(out, mark, PATH_NATIVE_OOM);
     }
 
-    if (strbuf_len(out) == floor)
+    /* no names left: "/" or "." — but a Windows root stands alone */
+    if (!(windows && absolute)
+        && filec_finish_names(out, floor, absolute) != SEQC_OK)
     {
-        /* no names left: POSIX "/" or "." — a Windows root stands alone */
-        string_t alone = absolute ? STRING_LIT("/") : STRING_LIT(".");
-        bool win_root = style == PATH_STYLE_WINDOWS && absolute;
-        if (!win_root && strbuf_append(out, alone) != SEQC_OK)
-        {
-            return fail(out, mark, PATH_NATIVE_OOM);
-        }
+        return fail(out, mark, PATH_NATIVE_OOM);
     }
     return PATH_NATIVE_OK;
 }

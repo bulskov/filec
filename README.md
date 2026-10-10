@@ -43,8 +43,8 @@ Goals:
 
 - **Speed where it matters.** Directory listing asks for exactly the metadata
   you want (`want` / `valid` bitmasks), so each platform can use its fast path.
-- **No hidden allocation.** Everything that allocates takes an `allocator_t`;
-  path conversion uses a stack buffer or a buffer you provide.
+- **No hidden allocation.** Paths are built into a `strbuf_t` you own and
+  reuse; everything else that allocates takes an `allocator_t`.
 - **Same semantics everywhere.** Where platforms differ (case, links, watch
   recursion, timestamps) the API picks one meaning and documents it.
 - **Library-specific errors.** `fs_err_t { kind, os_code }` — a portable kind
