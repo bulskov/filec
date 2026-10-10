@@ -74,9 +74,24 @@ order a file tree wants.
 ### Views vs allocation
 
 Anatomy functions (`parent`, `file_name`, `stem`, `extension`) return
-**views** into the input — no allocation. Anything that builds a new string
-takes an `allocator_t`, always returns memory from it (never a view, so the
-lifetime is always the allocator's), and returns `{NULL, 0}` on OOM.
+**views** into the input — no allocation.
+
+Anything that builds a new path (`normalize`, `join`, `join_iter`,
+`with_extension`, `relative`, and `path_from_native` / `path_to_native`)
+**appends to a `strbuf_t` the caller owns** and returns an error code:
+
+- The caller holds the memory, so the caller knows it is responsible for it.
+  One strbuf, cleared between calls, serves a whole directory listing; after
+  the first few calls nothing allocates.
+- On failure the strbuf is left exactly as it was, so there are no partial
+  results and no cleanup at the call site.
+- The functions need no temporaries: they normalise in place in `out`, with
+  `strbuf_truncate` for `..` and the length at entry (or the end of a root)
+  as the floor. An earlier version returned a fresh allocation per result;
+  making that correct for any allocator meant freeing every temporary on
+  every path, which was exactly the bookkeeping arenas exist to avoid.
+- The rule that comes with it: the input must not point into `out`, because
+  an append may move the buffer.
 
 ### Known limitations (deliberate)
 

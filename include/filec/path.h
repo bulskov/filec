@@ -3,8 +3,6 @@
  * filesystem access, no platform: "/a/b/../c" normalises to "/a/c" even if
  * b is a symlink.  Use the fs_ functions when the real filesystem matters.
  *
- * STATUS: DRAFT INTERFACE — not implemented yet.  See docs/interface.md.
- *
  * The canonical form — one syntax on every platform:
  *
  *   - '/' is the only separator.
@@ -27,10 +25,22 @@
  * out is normalised; the functions below expect normalised input unless
  * they say otherwise (path_normalize and path_join accept anything).
  *
- * Results marked "view" point into the input (or are string literals): no
- * allocation, valid as long as the input is.  Allocating functions always
- * return memory from the allocator you pass, normalised, and {NULL, 0} on
- * OOM. */
+ * Two kinds of result:
+ *
+ *   - Anatomy functions return VIEWS into the input (or string literals):
+ *     no allocation, valid as long as the input is.
+ *   - Building functions APPEND a normalised path to out, a strbuf you own,
+ *     like filec/native.h.  Create it once, strbuf_clear it between calls;
+ *     nothing else is allocated.  Look at the result with strbuf_view(out),
+ *     keep it with strbuf_to_string(out, alloc).
+ *
+ * Every building function returns a path_err_t, and:
+ *   - on failure leaves out exactly as it was (no partial result);
+ *   - treats what out already holds as text it must not touch — ".." in the
+ *     result never reaches back into it;
+ *   - needs input that does not point into out: an append may move out's
+ *     buffer.  Build into a second strbuf instead;
+ *   - returns PATH_INVALID for out == NULL. */
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -38,6 +48,13 @@
 #include "arena/allocator.h"
 #include "seqc/iter.h"
 #include "seqc/string.h"
+
+typedef enum
+{
+    PATH_OK = 0,
+    PATH_INVALID, /* out == NULL, or input the function cannot use       */
+    PATH_OOM,     /* out's allocator returned NULL; out is unchanged     */
+} path_err_t;
 
 /* How components compare.  Paths themselves are platform-neutral; whether
  * "A" and "a" name the same file is not, so comparisons ask. */
@@ -88,33 +105,34 @@ string_t path_extension(string_t p);
  * "." yields nothing.  path_join_iter(path_components(p)) gives p back. */
 iter_t path_components(string_t p, allocator_t a);
 
-/* --- Building (allocating, normalised results) --------------------------- */
-
-/* a, then b.  An absolute b replaces a.  Accepts unnormalised input:
- *   join("/a", "b") = "/a/b"     join("/a/b", "../c") = "/a/c"
- *   join("/a", "/b") = "/b"      join("/a", "") = "/a" */
-string_t path_join(string_t a, string_t b, allocator_t alloc);
-
-/* Joins every string_t yielded by parts, left to right, as path_join.
- * Consumes the iterator.  No parts gives ".". */
-string_t path_join_iter(iter_t parts, allocator_t alloc);
+/* --- Building (append to out, normalised results) ----------------------- */
 
 /* The normalised form of any canonical path: empty and "." components
  * dropped, ".." resolved lexically.  ".." never climbs above "/"; a
  * relative path keeps its leading ".."s.  "" -> "."
  *   "/a//./b/../c/" -> "/a/c"      "a/../.." -> ".."      "/.." -> "/" */
-string_t path_normalize(string_t p, allocator_t alloc);
+path_err_t path_normalize(string_t p, strbuf_t *out);
 
-/* p with its extension replaced (or added, or with ext = "" removed). */
-string_t path_with_extension(string_t p, string_t ext, allocator_t alloc);
+/* a, then b.  An absolute b replaces a.  Accepts unnormalised input:
+ *   join("/a", "b") = "/a/b"     join("/a/b", "../c") = "/a/c"
+ *   join("/a", "/b") = "/b"      join("/a", "") = "/a" */
+path_err_t path_join(string_t a, string_t b, strbuf_t *out);
+
+/* Joins every string_t yielded by parts, left to right, as path_join.
+ * Always consumes the iterator, also on failure.  No parts gives ".". */
+path_err_t path_join_iter(iter_t parts, strbuf_t *out);
+
+/* p with its extension replaced (or added, or with ext = "" removed).
+ * PATH_INVALID when p has no file name to change ("/", "."). */
+path_err_t path_with_extension(string_t p, string_t ext, strbuf_t *out);
 
 /* The relative path that leads from base to target, both absolute:
  *   ("/a/b", "/a/c/d") -> "../c/d"     ("/a", "/a") -> "."
  * Every absolute path shares the root "/", so there is always an answer —
  * on Windows it may lead through the virtual root ("../../D:/x"), which has
- * no native form.  Returns {NULL, 0} if base or target is relative. */
-string_t path_relative(
-    string_t base, string_t target, path_case_t cs, allocator_t alloc);
+ * no native form.  PATH_INVALID if base or target is relative. */
+path_err_t path_relative(
+    string_t base, string_t target, path_case_t cs, strbuf_t *out);
 
 /* --- Comparing -------------------------------------------------------------
  */
