@@ -8,3 +8,4 @@ endfunction()
 
 filec_test(smoke)
 filec_test(path)
+filec_test(native)
