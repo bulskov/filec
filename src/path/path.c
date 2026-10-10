@@ -195,7 +195,7 @@ string_t path_join(string_t a, string_t b, allocator_t alloc)
         }
     }
 
-    string_t result = path_normalize(strbuf_finish(buf), alloc);
+    string_t result = path_normalize(strbuf_view(buf), alloc);
     strbuf_destroy(buf);
     return result;
 }
@@ -243,7 +243,7 @@ string_t path_join_iter(iter_t parts, allocator_t alloc)
     }
     iter_destroy(&parts);
 
-    string_t result = path_normalize(strbuf_finish(buf), alloc);
+    string_t result = path_normalize(strbuf_view(buf), alloc);
     strbuf_destroy(buf);
     return result;
 }
@@ -338,7 +338,7 @@ string_t path_normalize(string_t p, allocator_t alloc)
         strbuf_append(buf, STRING_LIT("."));
     }
 
-    string_t result = string_copy(strbuf_finish(buf), alloc);
+    string_t result = strbuf_to_string(buf, alloc);
     strbuf_destroy(buf);
     return result;
 }
@@ -382,7 +382,7 @@ string_t path_with_extension(string_t p, string_t ext, allocator_t alloc)
             strbuf_destroy(buf);
             return (string_t){NULL, 0};
         }
-        string_t result = string_copy(strbuf_finish(buf), alloc);
+        string_t result = strbuf_to_string(buf, alloc);
         strbuf_destroy(buf);
         return result;
     }
@@ -464,7 +464,7 @@ string_t path_relative(
         goto oom;
     }
 
-    string_t result = string_copy(strbuf_finish(buf), alloc);
+    string_t result = strbuf_to_string(buf, alloc);
     strbuf_destroy(buf);
     return result;
 
