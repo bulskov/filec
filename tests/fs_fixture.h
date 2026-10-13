@@ -6,7 +6,8 @@
  * test — a broken fs_mkdir must not be able to break its own test setup.
  *
  * Include this header FIRST in a test file: on POSIX it asks for the
- * POSIX 2008 declarations (the build is strict C11, no extensions).
+ * POSIX 2008 declarations (the build is strict C11, no extensions), plus
+ * the Darwin ones on macOS.
  *
  *   fx_setup() / fx_teardown()   create / delete the directory (with all
  *                                its contents), from ctt_before_each and
@@ -21,6 +22,7 @@
 
 #ifndef _WIN32
 #define _XOPEN_SOURCE 700
+#define _DARWIN_C_SOURCE /* macOS hides mkdtemp under plain XOPEN */
 #endif
 
 #include <stdbool.h>
