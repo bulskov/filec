@@ -6,6 +6,7 @@ target_sources(filec PRIVATE
     path/path.c
     path/native.c
     path/names.c
+    fs_common.c
 )
 
 # One fs backend per platform.
@@ -21,15 +22,19 @@ endif()
 
 target_include_directories(filec PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
-    $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>   # generated version.h
+    $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include> # generated version.h
     $<INSTALL_INTERFACE:include>
 )
+
+# The same warnings as the tests: the library code is held to them too.
+target_compile_options(filec PRIVATE
+    $<IF:$<BOOL:${MSVC}>,/W4,-Wall -Wextra -Wpedantic>)
 
 # seqc propagates arena's include dirs.
 target_link_libraries(filec PUBLIC seqc)
 
 target_compile_options(filec PRIVATE
     $<IF:$<BOOL:${MSVC}>,
-        /W4,
-        -Wall -Wextra -Wpedantic -Wno-unused-parameter>
+    /W4,
+    -Wall -Wextra -Wpedantic -Wno-unused-parameter>
 )
