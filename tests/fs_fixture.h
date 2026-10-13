@@ -113,7 +113,7 @@ static inline const wchar_t *fx_wide(const char *utf8)
 static inline void fx_remove_tree(const wchar_t *dir)
 {
     wchar_t pattern[8192];
-    _snwprintf(pattern, 8192, L"%ls\\*", dir);
+    swprintf(pattern, 8192, L"%ls\\*", dir);
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(pattern, &fd);
     if (h != INVALID_HANDLE_VALUE)
@@ -126,7 +126,7 @@ static inline void fx_remove_tree(const wchar_t *dir)
                 continue;
             }
             wchar_t child[8192];
-            _snwprintf(child, 8192, L"%ls\\%ls", dir, fd.cFileName);
+            swprintf(child, 8192, L"%ls\\%ls", dir, fd.cFileName);
             SetFileAttributesW(child, FILE_ATTRIBUTE_NORMAL);
             bool is_dir = fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
             bool is_link = fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT;
@@ -158,7 +158,7 @@ static inline void fx_setup(void)
     }
     static unsigned counter;
     wchar_t dir[8192];
-    _snwprintf(
+    swprintf(
         dir,
         8192,
         L"%lsfilec_fs_test_%lu_%u",
@@ -219,7 +219,8 @@ static inline bool fx_set_hidden(const char *rel)
 
 static inline FILE *fx_fopen(const char *native, const char *mode)
 {
-    return _wfopen(fx_wide(native), fx_wide(mode));
+    FILE *f = NULL;
+    return _wfopen_s(&f, fx_wide(native), fx_wide(mode)) == 0 ? f : NULL;
 }
 
 #else /* POSIX */
