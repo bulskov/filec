@@ -1,23 +1,33 @@
 #pragma once
-/* filec/fs — filesystem access.  POSIX (Linux first) and Win32 backends.
+/* filec/fs — filesystem access.  POSIX (Linux, macOS) and Win32 backends.
  *
- * STATUS: DRAFT INTERFACE — not implemented yet.  See docs/interface.md.
+ * STATUS: being implemented step by step — see README.md.  Step 1 (errors,
+ * mkdir, remove, stat, exists) is specified by tests/fs_basic_test.c.
  *
- * Paths:     every path in and out is CANONICAL and normalised (see
- *            filec/path.h): "/C:/Users/me", not "C:\Users\me".  Each call
- *            converts to the native form itself (path_to_native, plus NUL
- *            termination on POSIX, UTF-16 and the "\\?\" prefix on Windows)
- *            in a conversion buffer — see "Path buffers" below.  Paths typed
- *            by a user or given on a command line go through fs_from_native
- *            first.  Need not be NUL-terminated.
+ * Paths:     every path in and out is CANONICAL, normalised and ABSOLUTE
+ *            (see filec/path.h): "/C:/Users/me", not "C:\Users\me".  A
+ *            relative path is FS_ERR_INVALID — the current directory is
+ *            process-wide state, and a file manager runs many threads.
+ *            Paths typed by a user go through fs_from_native first.
+ *            Input need not be NUL-terminated.
+ * Path size: each call converts its paths to the native form (NUL on POSIX,
+ *            UTF-16 and "\\?\" on Windows) in a stack buffer.  A canonical
+ *            path longer than FS_PATH_MAX bytes is FS_ERR_NAME_TOO_LONG —
+ *            Linux refuses longer paths itself.
+ * Errors:    every function that can fail returns fs_err_t; results come
+ *            back through out-parameters.  FS_NODISCARD makes ignoring the
+ *            error a compiler warning.
+ * Strings:   results that are strings APPEND to a strbuf_t you own, as in
+ *            filec/path.h; on failure out is unchanged.  Names in directory
+ *            listings and watch events are views, valid until the next
+ *            read — copy what you keep.
  * Names out: raw bytes.  On Linux they may be invalid UTF-8; nothing is
  *            "fixed" here — sanitising for display is the caller's job.
  * Blocking:  every function may block on I/O.  Call them from worker threads
  *            if you have a UI.
  * Threads:   functions are safe to call concurrently on different objects.
  *            An fs_dir_t is single-owner.  Positional file I/O (fs_read_at /
- *            fs_write_at) may run concurrently on the same file.
- * Memory:    nothing is allocated except through an allocator_t you pass. */
+ *            fs_write_at) may run concurrently on the same file. */
 
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -29,26 +39,14 @@
 #include "seqc/string.h"
 #include "seqc/vec.h"
 
-/* --- Path buffers -------------------------------------------------------- */
-/* By default every call converts its path arguments in a stack buffer of
- * FS_PATH_MAX bytes; longer paths fail with FS_ERR_NAME_TOO_LONG.
- *
- * For longer paths the caller hands in the buffer and decides where it is
- * allocated (stack, arena, static).  The *_buf variants are the primitive;
- * the plain functions are thin wrappers that pass a stack buffer.
- *
- * OPEN: the _buf variants are only sketched for fs_stat and fs_dir_open
- * below.  Decide whether every path-taking function gets one, or whether a
- * single fs_pathbuf_t argument goes on all functions.  See
- * docs/interface.md. */
-
+/* Longest canonical path, in bytes, that fs accepts. */
 #define FS_PATH_MAX 4096
 
-typedef struct
-{
-    void *ptr;   /* caller-owned scratch for path conversion           */
-    size_t size; /* bytes; Windows needs about 2 * path.len + 16       */
-} fs_pathbuf_t;
+#if defined(__GNUC__) || defined(__clang__)
+#define FS_NODISCARD __attribute__((warn_unused_result))
+#else
+#define FS_NODISCARD
+#endif
 
 /* --- Errors -------------------------------------------------------------- */
 
@@ -59,19 +57,19 @@ typedef enum
     FS_ERR_ACCESS, /* permission denied                              */
     FS_ERR_EXISTS,
     FS_ERR_NOT_EMPTY, /* directory not empty                         */
-    FS_ERR_NOT_DIR,
+    FS_ERR_NOT_DIR,   /* a path component (or the target) is not a dir */
     FS_ERR_IS_DIR,
     FS_ERR_CROSS_DEVICE, /* rename across volumes: copy + delete instead */
     FS_ERR_NO_SPACE,
-    FS_ERR_NAME_TOO_LONG, /* also: path does not fit the path buffer   */
+    FS_ERR_NAME_TOO_LONG, /* also: longer than FS_PATH_MAX              */
     FS_ERR_BUSY,          /* in use / sharing violation (Windows)      */
     FS_ERR_READ_ONLY,     /* read-only filesystem                      */
     FS_ERR_LOOP,          /* too many symlinks                         */
     FS_ERR_CANCELLED,     /* fs_op_t.cancel was set                    */
     FS_ERR_UNSUPPORTED,
-    FS_ERR_OOM, /* the allocator you passed returned NULL               */
-    FS_ERR_INVALID,
-    FS_ERR_IO, /* anything else; see os_code                            */
+    FS_ERR_OOM,     /* an allocator or strbuf could not grow            */
+    FS_ERR_INVALID, /* relative path, NUL byte, NULL out, ...           */
+    FS_ERR_IO,      /* anything else; see os_code                       */
 } fs_err_kind_t;
 
 typedef struct
@@ -80,7 +78,14 @@ typedef struct
     int32_t os_code; /* errno / GetLastError(), 0 if not from the OS */
 } fs_err_t;
 
-string_t fs_err_str(fs_err_t e); /* static, human-readable */
+static inline bool fs_ok(fs_err_t e)
+{
+    return e.kind == FS_OK;
+}
+
+/* A short, static, human-readable description of e.kind ("not found").
+ * Never empty, also for a kind out of range. */
+string_t fs_err_str(fs_err_t e);
 
 /* --- Entries ------------------------------------------------------------- */
 
@@ -94,7 +99,9 @@ typedef enum
 } fs_kind_t;
 
 /* Requested (want) and delivered (valid) fields.  The backend fills what it
- * gets for free plus what you asked for; check valid, never assume. */
+ * gets for free plus what you asked for; check valid, never assume.  Every
+ * field you ask for is delivered, except FS_F_BTIME where the filesystem
+ * does not record it. */
 typedef enum
 {
     FS_F_KIND = 1u << 0,
@@ -116,7 +123,7 @@ enum
 
 typedef struct
 {
-    string_t name;  /* file name only, no directory                  */
+    string_t name;  /* file name only, no directory — a view          */
     uint32_t valid; /* fs_field_t bits that are filled in            */
     fs_kind_t kind;
     uint32_t flags;
@@ -124,7 +131,7 @@ typedef struct
     uint64_t size;
     int64_t mtime_ns; /* Unix epoch                                   */
     int64_t btime_ns;
-    uint64_t dev, ino;
+    uint64_t dev, ino; /* together: the identity of the file          */
 } fs_entry_t;
 
 /* --- Reading directories ------------------------------------------------- */
@@ -132,26 +139,22 @@ typedef struct
 
 typedef struct fs_dir_t fs_dir_t;
 
-fs_dir_t *fs_dir_open(
-    string_t path, uint32_t want, allocator_t a, fs_err_t *err);
-fs_dir_t *fs_dir_open_buf(
-    string_t path,
-    uint32_t want,
-    fs_pathbuf_t buf,
-    allocator_t a,
-    fs_err_t *err);
+/* One allocation from a, for the directory and its buffer. */
+FS_NODISCARD fs_err_t
+fs_dir_open(string_t path, uint32_t want, allocator_t a, fs_dir_t **out);
 
-/* Fills up to cap entries, names allocated from `names`.  Returns the count;
- * 0 with err->kind == FS_OK means end of directory.  An entry that vanished
- * between listing and stat is skipped, not an error. */
-size_t fs_dir_read(
-    fs_dir_t *d, fs_entry_t *out, size_t cap, allocator_t names, fs_err_t *err);
+/* Fills up to cap entries and sets *count; 0 means end of directory.  The
+ * names are views into d, valid until the next fs_dir_read or
+ * fs_dir_close.  An entry that vanished between listing and stat is
+ * skipped, not an error. */
+FS_NODISCARD fs_err_t
+fs_dir_read(fs_dir_t *d, fs_entry_t *out, size_t cap, size_t *count);
 
-void fs_dir_close(fs_dir_t *d);
+void fs_dir_close(fs_dir_t *d); /* NULL is a no-op */
 
-/* Convenience: iter_t yielding fs_entry_t, names allocated from a.
- * Errors (open or mid-way) stop the iteration and are written to *err —
- * check it after the loop. */
+/* Convenience: iter_t yielding fs_entry_t (names valid until the next
+ * step).  iter_t has no error channel, so errors — opening or mid-way —
+ * stop the iteration and are written to *err: check it after the loop. */
 iter_t fs_dir_iter(string_t path, uint32_t want, allocator_t a, fs_err_t *err);
 
 /* --- Metadata ------------------------------------------------------------ */
@@ -161,24 +164,18 @@ enum
     FS_NOFOLLOW = 1u << 0, /* stat the link itself */
 };
 
-/* out->name is a view of path. */
-bool fs_stat(
-    string_t path,
-    uint32_t want,
-    uint32_t flags,
-    fs_entry_t *out,
-    fs_err_t *err);
-bool fs_stat_buf(
-    string_t path,
-    uint32_t want,
-    uint32_t flags,
-    fs_pathbuf_t buf,
-    fs_entry_t *out,
-    fs_err_t *err);
+/* out->name is a view of path's file name. */
+FS_NODISCARD fs_err_t
+fs_stat(string_t path, uint32_t want, uint32_t flags, fs_entry_t *out);
 
-bool fs_exists(string_t path); /* follows links */
-string_t fs_read_link(string_t path, allocator_t a, fs_err_t *err);
-string_t fs_real_path(string_t path, allocator_t a, fs_err_t *err);
+/* true if path names something, following links: a dangling link does
+ * not exist.  Any error counts as false. */
+bool fs_exists(string_t path);
+
+/* The target of a link, as stored (may be relative), appended to out. */
+FS_NODISCARD fs_err_t fs_read_link(string_t path, strbuf_t *out);
+/* path with every link resolved, appended to out. */
+FS_NODISCARD fs_err_t fs_real_path(string_t path, strbuf_t *out);
 
 /* --- Files --------------------------------------------------------------- */
 
@@ -196,21 +193,23 @@ enum
     FS_EXCL = 1u << 4, /* with FS_CREATE: fail if it exists */
 };
 
-bool fs_open(string_t path, uint32_t mode, fs_file_t *out, fs_err_t *err);
-/* Positional only — there is no seek and no hidden file position. */
-size_t fs_read_at(
-    fs_file_t f, uint64_t offset, void *dst, size_t n, fs_err_t *err);
-size_t fs_write_at(
-    fs_file_t f, uint64_t offset, const void *src, size_t n, fs_err_t *err);
-uint64_t fs_file_size(fs_file_t f, fs_err_t *err);
-bool fs_sync(fs_file_t f, fs_err_t *err);
+FS_NODISCARD fs_err_t fs_open(string_t path, uint32_t mode, fs_file_t *out);
+/* Positional only — there is no seek and no hidden file position.
+ * fs_read_at sets *got; fewer than n bytes means end of file.
+ * fs_write_at writes all n bytes or fails. */
+FS_NODISCARD fs_err_t
+fs_read_at(fs_file_t f, uint64_t offset, void *dst, size_t n, size_t *got);
+FS_NODISCARD fs_err_t
+fs_write_at(fs_file_t f, uint64_t offset, const void *src, size_t n);
+FS_NODISCARD fs_err_t fs_file_size(fs_file_t f, uint64_t *size);
+FS_NODISCARD fs_err_t fs_sync(fs_file_t f);
 void fs_close(fs_file_t f);
 
-/* Whole-file helpers. */
-string_t fs_read_all(string_t path, allocator_t a, fs_err_t *err);
+/* Whole-file helpers.  fs_read_all appends the contents to out. */
+FS_NODISCARD fs_err_t fs_read_all(string_t path, strbuf_t *out);
 /* Write to a temp file in the same directory, fsync, rename over path.
  * Readers see the old or the new content, never a mix. */
-bool fs_write_atomic(string_t path, string_t data, fs_err_t *err);
+FS_NODISCARD fs_err_t fs_write_atomic(string_t path, string_t data);
 
 /* --- Changing the filesystem --------------------------------------------- */
 /* Single-object operations only.  Recursive copy / delete / walk are
@@ -229,28 +228,28 @@ enum
     FS_KEEP_METADATA = 1u << 1, /* copy: preserve mtime and mode */
 };
 
-bool fs_mkdir(string_t path, fs_err_t *err);
-bool fs_mkdir_all(string_t path, fs_err_t *err); /* like mkdir -p */
-/* File, link or EMPTY directory. */
-bool fs_remove(string_t path, fs_err_t *err);
+/* One directory; its parent must exist.  FS_ERR_EXISTS if path exists
+ * (whatever it is), FS_ERR_NOT_FOUND if the parent is missing,
+ * FS_ERR_NOT_DIR if the parent is a file. */
+FS_NODISCARD fs_err_t fs_mkdir(string_t path);
+FS_NODISCARD fs_err_t fs_mkdir_all(string_t path); /* like mkdir -p */
+/* A file, a link (not its target) or an EMPTY directory.
+ * FS_ERR_NOT_EMPTY for a directory with anything in it. */
+FS_NODISCARD fs_err_t fs_remove(string_t path);
 
 /* Atomic, same volume only (FS_ERR_CROSS_DEVICE otherwise).  Without
  * FS_REPLACE the existence check is atomic too: renameat2(RENAME_NOREPLACE)
  * / MoveFileExW without MOVEFILE_REPLACE_EXISTING. */
-bool fs_rename(string_t from, string_t to, uint32_t flags, fs_err_t *err);
+FS_NODISCARD fs_err_t fs_rename(string_t from, string_t to, uint32_t flags);
 
 /* One file.  copy_file_range / CopyFileExW; op may be NULL.
  * On cancel or error the partial target is removed. */
-bool fs_copy_file(
-    string_t from,
-    string_t to,
-    uint32_t flags,
-    const fs_op_t *op,
-    fs_err_t *err);
+FS_NODISCARD fs_err_t
+fs_copy_file(string_t from, string_t to, uint32_t flags, const fs_op_t *op);
 
 /* XDG trash spec on Linux (home trash, or $topdir/.Trash-$uid on other
  * volumes), Recycle Bin on Windows. */
-bool fs_trash(string_t path, fs_err_t *err);
+FS_NODISCARD fs_err_t fs_trash(string_t path);
 
 /* --- Locations and volumes ----------------------------------------------- */
 
@@ -263,16 +262,16 @@ typedef enum
     FS_LOC_DATA,
 } fs_loc_t;
 
-/* XDG base directories / Windows Known Folders. */
-string_t fs_location(fs_loc_t loc, allocator_t a, fs_err_t *err);
-string_t fs_cwd(allocator_t a, fs_err_t *err);
+/* XDG base directories / Windows Known Folders, appended to out. */
+FS_NODISCARD fs_err_t fs_location(fs_loc_t loc, strbuf_t *out);
+FS_NODISCARD fs_err_t fs_cwd(strbuf_t *out);
 
-/* Any native path the OS would accept -> canonical, absolute, normalised.
- * Unlike path_from_native (filec/native.h), relative forms are resolved
- * against the real current directory, including Windows' "C:x" (drive C's
- * current directory) and "\x" (root of the current drive).  For paths
- * typed by a user or given on a command line. */
-string_t fs_from_native(string_t native, allocator_t a, fs_err_t *err);
+/* Any native path the OS would accept -> canonical, absolute, normalised,
+ * appended to out.  Unlike path_from_native (filec/native.h), relative
+ * forms are resolved against the real current directory, including
+ * Windows' "C:x" (drive C's current directory) and "\x" (root of the
+ * current drive).  For paths typed by a user or given on a command line. */
+FS_NODISCARD fs_err_t fs_from_native(string_t native, strbuf_t *out);
 
 typedef struct
 {
@@ -283,9 +282,10 @@ typedef struct
     bool read_only;
 } fs_volume_t;
 
-/* vec_t of fs_volume_t.  Linux: /proc/self/mountinfo minus pseudo-fs. */
-vec_t *fs_volumes(allocator_t a, fs_err_t *err);
-bool fs_space(string_t path, uint64_t *total, uint64_t *free, fs_err_t *err);
+/* *out: a vec_t of fs_volume_t; it and its strings come from a.
+ * Linux: /proc/self/mountinfo minus pseudo-fs. */
+FS_NODISCARD fs_err_t fs_volumes(allocator_t a, vec_t **out);
+FS_NODISCARD fs_err_t fs_space(string_t path, uint64_t *total, uint64_t *avail);
 
 /* --- Watching ------------------------------------------------------------ */
 /* Events are hints, not truth: on FS_W_OVERFLOW (or whenever in doubt)
@@ -310,19 +310,19 @@ typedef struct
 
 typedef struct fs_watch_t fs_watch_t;
 
-fs_watch_t *fs_watch_create(allocator_t a, fs_err_t *err);
+FS_NODISCARD fs_err_t fs_watch_create(allocator_t a, fs_watch_t **out);
 /* add/remove may be called from any thread, also while another waits.
- * Returns a watch id, 0 on failure. */
-uint32_t fs_watch_add(fs_watch_t *w, string_t dir, fs_err_t *err);
+ * *id is never 0. */
+FS_NODISCARD fs_err_t fs_watch_add(fs_watch_t *w, string_t dir, uint32_t *id);
 void fs_watch_remove(fs_watch_t *w, uint32_t watch_id);
-/* Blocks until events, timeout or fs_watch_wake.  Names allocated from a. */
-size_t fs_watch_wait(
+/* Blocks until events, timeout or fs_watch_wake; sets *count.  Names are
+ * views into w, valid until the next fs_watch_wait. */
+FS_NODISCARD fs_err_t fs_watch_wait(
     fs_watch_t *w,
     fs_watch_event_t *out,
     size_t cap,
     uint32_t timeout_ms,
-    allocator_t a,
-    fs_err_t *err);
+    size_t *count);
 /* Any thread: unblock a waiting fs_watch_wait (e.g. for shutdown). */
 void fs_watch_wake(fs_watch_t *w);
 void fs_watch_destroy(fs_watch_t *w);

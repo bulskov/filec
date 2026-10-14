@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-# Usage: ./build.sh [clean] [debug|release|asan|tsan|dev]
+# Usage: ./build.sh [clean] [debug|release|asan|tsan|dev|mingw]
 
 CLEAN=0
 PRESET="debug"

@@ -87,10 +87,17 @@ to one copy.
 CMake ≥ 3.20 and Ninja. Dependencies are fetched at configure time.
 
 ```sh
-./build.sh            # debug build      (presets: debug, release, asan, tsan, dev)
-./test.sh             # build + ctest    (modes:   debug, asan, tsan, dev)
+./build.sh            # debug build      (presets: debug, release, asan, tsan, dev, mingw)
+./test.sh             # build + ctest    (modes:   debug, asan, tsan, dev, mingw)
 ./test.sh dev         # against local checkouts ../seqc and ../ctt
+./test.sh mingw       # Windows build (MinGW), tests run under Wine
 ```
+
+The `mingw` preset cross-compiles for Windows on Linux and runs the tests
+through Wine — a quick check of the Win32 backend without a CI round trip.
+It uses Fedora's toolchain file (`dnf install mingw64-gcc wine`). MinGW's
+headers and Wine are not MSVC and Windows: CI (clang-cl on Windows) stays
+the final word.
 
 The `asan` and `tsan` presets use clang. `test.sh` also fails if `malloc`/`free`
 appear in `src/` — memory comes from the caller's `allocator_t`.

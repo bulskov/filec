@@ -104,30 +104,40 @@ Anything that builds a new path (`normalize`, `join`, `join_iter`,
 
 ## fs — the OS boundary
 
-### Path buffers (decided: stack buffer, or caller-provided buffer)
+### Paths in: absolute only, converted in a stack buffer (decided)
 
-Every `fs` call must convert its path: NUL-terminate on POSIX, UTF-8 → UTF-16
-plus `\\?\` prefix on Windows. Rather than passing an allocator to every call:
+Every `fs` call takes **canonical, normalised, absolute** paths. A relative
+path is `FS_ERR_INVALID`: the current directory is process-wide state, and a
+file manager runs many threads. `fs_from_native` resolves what a user types.
 
-- **Default:** the plain functions use a stack buffer of `FS_PATH_MAX` (4096)
-  bytes. Longer paths fail with `FS_ERR_NAME_TOO_LONG`. This matches Linux's
-  own `PATH_MAX`.
-- **Caller-provided buffer:** for longer paths, the caller passes an
-  `fs_pathbuf_t { ptr, size }` and decides where it lives — stack, arena,
-  static. Windows needs about `2 * len + 16` bytes for UTF-16 plus prefix.
+Every call converts its paths to the native form — NUL-terminated on POSIX,
+UTF-16 with the `\\?\` prefix on Windows — in a **stack buffer**. A
+canonical path longer than `FS_PATH_MAX` (4096) bytes is
+`FS_ERR_NAME_TOO_LONG`.
 
-The plain function is a thin wrapper that calls the buffer variant with a
-stack buffer, so there is one implementation per operation.
+An earlier draft added `_buf` variants (or an `fs_pathbuf_t` argument) for
+longer paths. Dropped: Linux refuses paths over `PATH_MAX` (4096) in the
+kernel anyway, and on Windows 4096 UTF-8 bytes are at most 4096 UTF-16
+units — about 8 KB of stack with the prefix. Longer Windows paths exist but
+are rare; they get an honest error instead of doubling the API.
 
-**Open:** the header sketches `_buf` variants only for `fs_dir_open` and
-`fs_stat` (the hot paths). Options:
+### Errors: returned, results through out-parameters (decided)
 
-1. `_buf` variant for every path-taking function — explicit, but doubles the
-   API surface.
-2. `_buf` variants only where long paths are realistic (listing, stat, open,
-   copy, rename), plain functions elsewhere.
-3. No variants; instead one optional `fs_pathbuf_t *` parameter (NULL = stack)
-   on every function — one API, slightly noisier calls.
+Every function that can fail returns `fs_err_t { kind, os_code }`, like
+`path_err_t` and `path_native_err_t`; results come back through
+out-parameters. `FS_NODISCARD` (`warn_unused_result` on GCC/Clang) makes an
+ignored error a warning — the useful part of C++'s `expected`. A generic
+result type would need a struct per result type and macros, and without
+lambdas there is no chaining to gain. `fs_ok(e)` is the short test.
+
+### Strings out (decided)
+
+Results that are strings (`fs_read_link`, `fs_real_path`, `fs_cwd`,
+`fs_location`, `fs_from_native`, `fs_read_all`) **append to a `strbuf_t`**
+the caller owns, as in `path`. Names in directory listings and watch events
+are **views** into the `fs_dir_t` / `fs_watch_t` — on Linux straight into
+the `getdents64` buffer — valid until the next read. A file manager copies
+the names it keeps into its own model anyway.
 
 ### `want` / `valid` metadata masks
 
@@ -153,7 +163,7 @@ caller-provided `fs_err_t` and stops (the "side channel" approach):
 
 ```c
 fs_err_t err = {0};
-iter_t it = fs_dir_iter(path, FS_F_SIZE, &err, alloc);
+iter_t it = fs_dir_iter(path, FS_F_SIZE, alloc, &err);
 vec_extend(v, iter_filter(it, is_big, NULL));
 if (err.kind != FS_OK) { /* the loop stopped early */ }
 ```
@@ -218,7 +228,6 @@ first addition once the needs are clear.
 
 ## Open questions
 
-- Path buffers: which of the three options above for `_buf` variants?
 - `fs_volumes` on Linux: which mounts count as "pseudo" (proc, sysfs, cgroup,
   tmpfs?, overlay?) and are hidden?
 - Does `fs_entry_t` need `atime`, owner/group, or link target?
