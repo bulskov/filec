@@ -58,6 +58,16 @@
                 "FETCHCONTENT_SOURCE_DIR_SEQC": "${sourceDir}/../seqc",
                 "FETCHCONTENT_SOURCE_DIR_CTT": "${sourceDir}/../ctt"
             }
+        },
+        {
+            "name": "mingw",
+            "displayName": "Debug for Windows (MinGW cross-compiler), tests run under Wine",
+            "inherits": "debug",
+            "binaryDir": "${sourceDir}/build/mingw",
+            "toolchainFile": "/usr/share/mingw/toolchain-mingw64.cmake",
+            "cacheVariables": {
+                "CMAKE_CROSSCOMPILING_EMULATOR": "wine"
+            }
         }
     ],
     "buildPresets": [
@@ -65,7 +75,8 @@
         { "name": "release", "configurePreset": "release" },
         { "name": "asan",    "configurePreset": "asan" },
         { "name": "tsan",    "configurePreset": "tsan" },
-        { "name": "dev",     "configurePreset": "dev" }
+        { "name": "dev",     "configurePreset": "dev" },
+        { "name": "mingw",   "configurePreset": "mingw" }
     ],
     "testPresets": [
         {
@@ -77,6 +88,7 @@
         { "name": "debug", "inherits": "base", "configurePreset": "debug" },
         { "name": "asan",  "inherits": "base", "configurePreset": "asan" },
         { "name": "tsan",  "inherits": "base", "configurePreset": "tsan" },
-        { "name": "dev",   "inherits": "base", "configurePreset": "dev" }
+        { "name": "dev",   "inherits": "base", "configurePreset": "dev" },
+        { "name": "mingw", "inherits": "base", "configurePreset": "mingw" }
     ]
 }
