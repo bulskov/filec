@@ -2,7 +2,8 @@
 /* filec/fs — filesystem access.  POSIX (Linux, macOS) and Win32 backends.
  *
  * STATUS: being implemented step by step — see README.md.  Step 1 (errors,
- * mkdir, remove, stat, exists) is specified by tests/fs_basic_test.c.
+ * mkdir, remove, stat, exists): tests/fs_basic_test.c.  Step 2 (files):
+ * tests/fs_file_test.c.
  *
  * Paths:     every path in and out is CANONICAL, normalised and ABSOLUTE
  *            (see filec/path.h): "/C:/Users/me", not "C:\Users\me".  A
@@ -181,34 +182,67 @@ FS_NODISCARD fs_err_t fs_real_path(string_t path, strbuf_t *out);
 
 typedef struct
 {
-    intptr_t h; /* fd or HANDLE — no allocation */
+    intptr_t h; /* fd or HANDLE — no allocation; -1 when no file */
 } fs_file_t;
+
+/* "No file": what fs_open leaves in *out on failure.  -1 is an invalid fd
+ * and INVALID_HANDLE_VALUE alike.  fs_close(FS_FILE_NONE) is a no-op. */
+#define FS_FILE_NONE ((fs_file_t){-1})
+
+static inline bool fs_file_is_open(fs_file_t f)
+{
+    return f.h != -1;
+}
 
 enum
 {
     FS_READ = 1u << 0,
     FS_WRITE = 1u << 1,
-    FS_CREATE = 1u << 2,
-    FS_TRUNC = 1u << 3,
-    FS_EXCL = 1u << 4, /* with FS_CREATE: fail if it exists */
+    FS_CREATE = 1u << 2, /* create if missing (needs FS_WRITE)       */
+    FS_TRUNC = 1u << 3,  /* empty an existing file (needs FS_WRITE)  */
+    FS_EXCL = 1u << 4,   /* with FS_CREATE: fail if it exists        */
 };
 
+/* Opens a regular file.  mode needs FS_READ and/or FS_WRITE; FS_CREATE or
+ * FS_TRUNC without FS_WRITE, and FS_EXCL without FS_CREATE, are
+ * FS_ERR_INVALID.  A directory is FS_ERR_IS_DIR in every mode.  A missing
+ * file without FS_CREATE is FS_ERR_NOT_FOUND; FS_CREATE | FS_EXCL on an
+ * existing one is FS_ERR_EXISTS.  New files get 0666 minus the umask on
+ * POSIX.
+ *
+ * The same on every platform: the handle is not inherited by child
+ * processes, and an open file does not lock others out — they may open,
+ * rename or remove it (Windows: FILE_SHARE_READ | WRITE | DELETE).
+ * On failure *out is FS_FILE_NONE. */
 FS_NODISCARD fs_err_t fs_open(string_t path, uint32_t mode, fs_file_t *out);
-/* Positional only — there is no seek and no hidden file position.
- * fs_read_at sets *got; fewer than n bytes means end of file.
- * fs_write_at writes all n bytes or fails. */
+
+/* Positional only — there is no seek and no hidden file position, so
+ * several threads may read and write the same file at once.
+ *
+ * fs_read_at reads up to n bytes at offset and sets *got; fewer than n
+ * means end of file, and at or past the end *got is 0 (not an error).
+ * fs_write_at writes all n bytes or fails; writing past the end extends
+ * the file, and a gap reads back as zeros.  n == 0 does nothing. */
 FS_NODISCARD fs_err_t
 fs_read_at(fs_file_t f, uint64_t offset, void *dst, size_t n, size_t *got);
 FS_NODISCARD fs_err_t
 fs_write_at(fs_file_t f, uint64_t offset, const void *src, size_t n);
 FS_NODISCARD fs_err_t fs_file_size(fs_file_t f, uint64_t *size);
+/* Data and size on the disk before it returns (fsync / FlushFileBuffers). */
 FS_NODISCARD fs_err_t fs_sync(fs_file_t f);
-void fs_close(fs_file_t f);
+void fs_close(fs_file_t f); /* FS_FILE_NONE is a no-op */
 
-/* Whole-file helpers.  fs_read_all appends the contents to out. */
+/* Whole-file helpers. */
+
+/* Appends the whole file to out; out is unchanged on failure.  A
+ * directory is FS_ERR_IS_DIR. */
 FS_NODISCARD fs_err_t fs_read_all(string_t path, strbuf_t *out);
-/* Write to a temp file in the same directory, fsync, rename over path.
- * Readers see the old or the new content, never a mix. */
+
+/* Replaces (or creates) path with data: written to a temp file in the same
+ * directory, synced, renamed over path.  Readers see the old or the new
+ * content, never a mix, and a crash leaves one or the other.  No temp file
+ * is left behind, also on failure.  A directory at path is
+ * FS_ERR_IS_DIR and stays as it is. */
 FS_NODISCARD fs_err_t fs_write_atomic(string_t path, string_t data);
 
 /* --- Changing the filesystem --------------------------------------------- */

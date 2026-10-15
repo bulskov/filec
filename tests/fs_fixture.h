@@ -18,7 +18,11 @@
  *   fx_symlink(target, rel)      create a symlink; false where the OS does
  *                                not allow it (Windows without developer
  *                                mode) — tests then skip that part
- *   fx_set_hidden(rel)           Windows hidden attribute; false on POSIX */
+ *   fx_set_hidden(rel)           Windows hidden attribute; false on POSIX
+ *   fx_read_file(rel, &len)      the contents of a file (static buffer,
+ *                                up to 64 KiB), NULL if it cannot be read
+ *   fx_count_entries(rel)        entries in a directory, without . and ..;
+ *                                -1 if it cannot be read */
 
 #ifndef _WIN32
 #define _XOPEN_SOURCE 700
@@ -36,6 +40,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <dirent.h>
 #include <ftw.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -156,18 +161,27 @@ static inline void fx_setup(void)
     {
         abort();
     }
+    /* Process ids are reused (under Wine almost always), so a directory a
+     * crashed run left behind can have this name: take the next one. */
     static unsigned counter;
     wchar_t dir[8192];
-    swprintf(
-        dir,
-        8192,
-        L"%lsfilec_fs_test_%lu_%u",
-        tmp,
-        (unsigned long)GetCurrentProcessId(),
-        counter++);
-    if (!CreateDirectoryW(dir, NULL))
+    for (;;)
     {
-        abort();
+        swprintf(
+            dir,
+            8192,
+            L"%lsfilec_fs_test_%lu_%u",
+            tmp,
+            (unsigned long)GetCurrentProcessId(),
+            counter++);
+        if (CreateDirectoryW(dir, NULL))
+        {
+            break;
+        }
+        if (GetLastError() != ERROR_ALREADY_EXISTS || counter > 100000)
+        {
+            abort();
+        }
     }
     char utf8[8192];
     if (!WideCharToMultiByte(
@@ -215,6 +229,28 @@ static inline bool fx_set_hidden(const char *rel)
 {
     return SetFileAttributesW(
         fx_wide(fx_native(FX(rel))), FILE_ATTRIBUTE_HIDDEN);
+}
+
+static inline int fx_count_entries(const char *rel)
+{
+    wchar_t pattern[8192];
+    swprintf(pattern, 8192, L"%ls\\*", fx_wide(fx_native(FX(rel))));
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        return -1;
+    }
+    int n = 0;
+    do
+    {
+        if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0)
+        {
+            n++;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return n;
 }
 
 static inline FILE *fx_fopen(const char *native, const char *mode)
@@ -283,6 +319,26 @@ static inline bool fx_set_hidden(const char *rel)
     return false;
 }
 
+static inline int fx_count_entries(const char *rel)
+{
+    DIR *d = opendir(fx_native(FX(rel)));
+    if (!d)
+    {
+        return -1;
+    }
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL)
+    {
+        if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0)
+        {
+            n++;
+        }
+    }
+    closedir(d);
+    return n;
+}
+
 static inline FILE *fx_fopen(const char *native, const char *mode)
 {
     return fopen(native, mode);
@@ -300,4 +356,24 @@ static inline bool fx_write_file(const char *rel, const char *text)
     size_t n = strlen(text);
     bool ok = fwrite(text, 1, n, f) == n;
     return fclose(f) == 0 && ok;
+}
+
+/* The contents of a file, read with stdio; *len gets the length.  The
+ * buffer is static (64 KiB) and NUL-terminated for convenience. */
+static inline const char *fx_read_file(const char *rel, size_t *len)
+{
+    static char buf[64 * 1024 + 1];
+    FILE *f = fx_fopen(fx_native(FX(rel)), "rb");
+    if (!f)
+    {
+        return NULL;
+    }
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    if (len)
+    {
+        *len = n;
+    }
+    return buf;
 }
