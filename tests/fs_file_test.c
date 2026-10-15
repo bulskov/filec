@@ -439,9 +439,9 @@ TEST(read_all_reports_oom)
         " that backs the strbuf below, not at"
         " all, it is far too long for it"));
     char mem[160];
-    fixed_arena_t small;
-    fixed_arena_init(&small, mem, sizeof mem);
-    strbuf_t *tiny = strbuf_create(fixed_arena_allocator(&small));
+    fixed_arena_t fixed;
+    fixed_arena_init(&fixed, mem, sizeof mem);
+    strbuf_t *tiny = strbuf_create(fixed_arena_allocator(&fixed));
     ASSERT_NOT_NULL(tiny);
     strbuf_append(tiny, P("keep"));
     ASSERT_EQ(FS_ERR_OOM, KIND(fs_read_all(FX("f"), tiny)));
