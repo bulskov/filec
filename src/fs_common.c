@@ -1,11 +1,13 @@
 #include "arena/fixed_arena.h"
+#include "filec/fs.h"
 #include "filec/path.h"
 #include "fs_internal.h"
 #include "seqc/string.h"
-#include <assert.h>
 
-/* --- Step 1 stubs: replace with the real thing ---------------------------
- * (tests/fs_basic_test.c).  They exist so the tests build and fail. */
+enum
+{
+    READ_CHUNK = 64 * 1024
+};
 
 string_t fs_err_str(fs_err_t e)
 {
@@ -78,4 +80,53 @@ fs_err_t filec_path_cstr(string_t path, char *buf, size_t buf_size)
         return (fs_err_t){.kind = FS_ERR_OOM, 0};
     }
     return (fs_err_t){.kind = FS_OK, 0};
+}
+
+fs_err_t fs_read_all(string_t path, strbuf_t *out)
+{
+    if (!out)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+
+    fs_file_t f;
+    fs_err_t err = fs_open(path, FS_READ, &f);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+
+    uint64_t offset = 0;
+    char buf[READ_CHUNK];
+
+    size_t out_pos = strbuf_len(out);
+
+    while (true)
+    {
+        size_t got;
+        err = fs_read_at(f, offset, buf, READ_CHUNK, &got);
+        if (!fs_ok(err))
+        {
+            fs_close(f);
+            strbuf_truncate(out, out_pos);
+            return err;
+        }
+        if (got == 0)
+        {
+            break;
+        }
+        if (strbuf_append(out, (string_t){buf, got}) != SEQC_OK)
+        {
+            fs_close(f);
+            strbuf_truncate(out, out_pos);
+            return (fs_err_t){FS_ERR_OOM, 0};
+        }
+        if (got < READ_CHUNK)
+        {
+            break;
+        }
+        offset += got;
+    }
+    fs_close(f);
+    return (fs_err_t){FS_OK, 0};
 }

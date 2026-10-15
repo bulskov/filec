@@ -383,3 +383,306 @@ fs_err_t fs_remove(string_t path)
     }
     return err;
 }
+
+/* --- Files --------------------------------------------------------------- */
+
+/* The POSIX backend's pieces, one for one:
+ *
+ *   open(flags, 0666) + O_CLOEXEC   CreateFileW(access, share, disposition);
+ *                                   handles are not inherited unless the
+ *                                   SECURITY_ATTRIBUTES say so (NULL here)
+ *   fstat + S_ISDIR                 a directory refuses to open without
+ *                                   FILE_FLAG_BACKUP_SEMANTICS, with
+ *                                   "access denied" — look at it to say IS_DIR
+ *   pread / pwrite                  ReadFile / WriteFile, the offset in an
+ *                                   OVERLAPPED (no seek, no shared position)
+ *   fstat st_size / fsync           GetFileSizeEx / FlushFileBuffers
+ *   rename                          MoveFileExW(REPLACE_EXISTING)
+ *
+ * Windows locks files by default (share mode 0); sharing everything gives
+ * the POSIX behaviour: others may read, write, rename and delete. */
+
+static HANDLE win_handle(fs_file_t f)
+{
+    return (HANDLE)f.h;
+}
+
+#define SHARE_ALL (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+
+/* The most ReadFile / WriteFile take at once (a DWORD count); the loops
+ * cut larger requests into pieces of this size. */
+#define IO_CHUNK ((DWORD)1 << 30)
+
+static OVERLAPPED at_offset(uint64_t offset)
+{
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof ov);
+    ov.Offset = (DWORD)offset;
+    ov.OffsetHigh = (DWORD)(offset >> 32);
+    return ov;
+}
+
+/* Empties an open file: the end of file moves to 0. */
+static bool truncate_handle(HANDLE h)
+{
+    FILE_END_OF_FILE_INFO eof;
+    eof.EndOfFile.QuadPart = 0;
+    return SetFileInformationByHandle(h, FileEndOfFileInfo, &eof, sizeof eof);
+}
+
+fs_err_t fs_open(string_t path, uint32_t mode, fs_file_t *out)
+{
+    if (!out)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    *out = FS_FILE_NONE;
+
+    wchar_t w[WPATH_MAX];
+    fs_err_t err = to_wide(path, w);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+
+    bool wr = mode & FS_WRITE;
+    if (!(mode & (FS_READ | FS_WRITE))
+        || ((mode & (FS_CREATE | FS_TRUNC)) && !wr)
+        || ((mode & FS_EXCL) && !(mode & FS_CREATE)))
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+
+    DWORD access = 0;
+    if (mode & FS_READ)
+    {
+        access |= GENERIC_READ;
+    }
+    if (wr)
+    {
+        access |= GENERIC_WRITE;
+    }
+
+    /* O_CREAT / O_EXCL map onto a "disposition".  O_TRUNC is done by hand
+     * after the open: CREATE_ALWAYS and TRUNCATE_EXISTING refuse a hidden
+     * or system file ("access denied"), and CREATE_ALWAYS also resets its
+     * attributes — POSIX's O_TRUNC only empties the file. */
+    DWORD disposition = OPEN_EXISTING;
+    if ((mode & FS_CREATE) && (mode & FS_EXCL))
+    {
+        disposition = CREATE_NEW;
+    }
+    else if (mode & FS_CREATE)
+    {
+        disposition = OPEN_ALWAYS;
+    }
+
+    HANDLE h = CreateFileW(
+        w, access, SHARE_ALL, NULL, disposition, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        err = last_err();
+        if (err.os_code == ERROR_ACCESS_DENIED)
+        {
+            DWORD attrs = GetFileAttributesW(w);
+            if (attrs != INVALID_FILE_ATTRIBUTES
+                && (attrs & FILE_ATTRIBUTE_DIRECTORY))
+            {
+                err.kind = FS_ERR_IS_DIR;
+            }
+        }
+        return err;
+    }
+
+    if ((mode & FS_TRUNC) && !truncate_handle(h))
+    {
+        err = last_err();
+        CloseHandle(h);
+        return err;
+    }
+
+    out->h = (intptr_t)h;
+    return ok;
+}
+
+fs_err_t fs_read_at(
+    fs_file_t f, uint64_t offset, void *dst, size_t n, size_t *got)
+{
+    if (!got)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    *got = 0;
+    if (!fs_file_is_open(f) || (!dst && n > 0) || offset > INT64_MAX)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+
+    char *p = dst;
+    while (*got < n)
+    {
+        size_t left = n - *got;
+        DWORD want = left > IO_CHUNK ? IO_CHUNK : (DWORD)left;
+        OVERLAPPED ov = at_offset(offset + *got);
+        DWORD r = 0;
+        if (!ReadFile(win_handle(f), p + *got, want, &r, &ov))
+        {
+            /* With an OVERLAPPED on a synchronous handle, reading at the
+             * end of the file is this "error" rather than 0 bytes. */
+            if (GetLastError() == ERROR_HANDLE_EOF)
+            {
+                break;
+            }
+            return last_err();
+        }
+        if (r == 0)
+        {
+            break; /* end of file */
+        }
+        *got += r;
+    }
+    return ok;
+}
+
+fs_err_t fs_write_at(fs_file_t f, uint64_t offset, const void *src, size_t n)
+{
+    if (!fs_file_is_open(f) || (!src && n > 0) || offset > INT64_MAX)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+
+    const char *p = src;
+    size_t written = 0;
+    while (written < n)
+    {
+        size_t left = n - written;
+        DWORD want = left > IO_CHUNK ? IO_CHUNK : (DWORD)left;
+        OVERLAPPED ov = at_offset(offset + written);
+        DWORD r = 0;
+        if (!WriteFile(win_handle(f), p + written, want, &r, &ov))
+        {
+            return last_err();
+        }
+        if (r == 0)
+        {
+            return (fs_err_t){FS_ERR_IO, 0};
+        }
+        written += r;
+    }
+    return ok;
+}
+
+fs_err_t fs_file_size(fs_file_t f, uint64_t *size)
+{
+    if (!fs_file_is_open(f) || !size)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    LARGE_INTEGER s;
+    if (!GetFileSizeEx(win_handle(f), &s))
+    {
+        return last_err();
+    }
+    *size = (uint64_t)s.QuadPart;
+    return ok;
+}
+
+fs_err_t fs_sync(fs_file_t f)
+{
+    if (!fs_file_is_open(f))
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    return FlushFileBuffers(win_handle(f)) ? ok : last_err();
+}
+
+void fs_close(fs_file_t f)
+{
+    if (fs_file_is_open(f))
+    {
+        CloseHandle(win_handle(f));
+    }
+}
+
+/* The temporary file's name: path + ".tmp<pid>.<n>", as on POSIX. */
+#define WTMP_MAX (WPATH_MAX + 32)
+
+fs_err_t fs_write_atomic(string_t path, string_t data)
+{
+    wchar_t w[WPATH_MAX];
+    fs_err_t err = to_wide(path, w);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+
+    /* POSIX's rename says EISDIR for a directory; MoveFileExW only says
+     * "access denied".  Look first.  The hidden and system attributes are
+     * Windows' part of what fchmod keeps on POSIX: the new file gets them
+     * too, or replacing a hidden file would make it visible.  (ReplaceFileW
+     * keeps even more — ACLs, creation time — but it needs an existing
+     * target and has its own odd failure modes.) */
+    DWORD keep = 0;
+    DWORD attrs = GetFileAttributesW(w);
+    if (attrs != INVALID_FILE_ATTRIBUTES)
+    {
+        if (attrs & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            return (fs_err_t){FS_ERR_IS_DIR, 0};
+        }
+        keep = attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+    }
+
+    wchar_t tmp[WTMP_MAX];
+    unsigned long pid = (unsigned long)GetCurrentProcessId();
+    HANDLE h = INVALID_HANDLE_VALUE;
+    for (int i = 1;; i++)
+    {
+        if (i == 1000)
+        {
+            return (fs_err_t){FS_ERR_IO, 0};
+        }
+        swprintf(tmp, WTMP_MAX, L"%ls.tmp%lu.%03d", w, pid, i);
+        /* CREATE_NEW is O_CREAT | O_EXCL: the check and the create in one
+         * step. */
+        h = CreateFileW(
+            tmp,
+            GENERIC_WRITE,
+            SHARE_ALL,
+            NULL,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | keep,
+            NULL);
+        if (h != INVALID_HANDLE_VALUE)
+        {
+            break;
+        }
+        DWORD code = GetLastError();
+        if (code != ERROR_FILE_EXISTS && code != ERROR_ALREADY_EXISTS)
+        {
+            return win_err(code);
+        }
+    }
+
+    fs_file_t f = {(intptr_t)h};
+    err = fs_write_at(f, 0, data.ptr, data.len);
+    if (fs_ok(err))
+    {
+        err = fs_sync(f);
+    }
+    fs_close(f);
+
+    /* WRITE_THROUGH: return only when the rename is on disk — POSIX's
+     * fsync of the directory, which the POSIX backend leaves out. */
+    if (fs_ok(err)
+        && !MoveFileExW(
+            tmp, w, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        err = last_err();
+    }
+    if (!fs_ok(err))
+    {
+        DeleteFileW(tmp);
+    }
+    return err;
+}
