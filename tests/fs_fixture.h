@@ -38,6 +38,7 @@
 #include "seqc/string.h"
 
 #ifdef _WIN32
+#include <share.h> /* _SH_DENYNO */
 #include <windows.h>
 #else
 #include <dirent.h>
@@ -253,10 +254,12 @@ static inline int fx_count_entries(const char *rel)
     return n;
 }
 
+/* _wfsopen with _SH_DENYNO: shared like fs_open's handles.  _wfopen_s
+ * opens unshared and cannot read a file a test still has open for
+ * writing (Wine does not enforce that; Windows does). */
 static inline FILE *fx_fopen(const char *native, const char *mode)
 {
-    FILE *f = NULL;
-    return _wfopen_s(&f, fx_wide(native), fx_wide(mode)) == 0 ? f : NULL;
+    return _wfsopen(fx_wide(native), fx_wide(mode), _SH_DENYNO);
 }
 
 #else /* POSIX */
