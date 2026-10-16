@@ -1448,3 +1448,124 @@ fs_err_t fs_real_path(string_t path, strbuf_t *out)
     CloseHandle(h);
     return fs_ok(err) ? append_canonical(final, n, out) : err;
 }
+
+/* --- Places (step 5, tests/fs_places_test.c) -----------------------------
+ *
+ *   getcwd                 GetCurrentDirectoryW
+ *   $HOME, XDG             Known Folders (SHGetKnownFolderPath): Profile,
+ *                          RoamingAppData, LocalAppData
+ *   $TMPDIR                GetTempPathW (TMP, TEMP, ...), long form
+ *   cwd + "/" + path       GetFullPathNameW, which knows all of Windows'
+ *                          relative forms ("C:x", "\x", "x\..\y") and its
+ *                          rules (trailing dots and spaces) */
+
+#include <shlobj.h>
+
+/* The known folders, defined here: their symbols live in different
+ * import libraries for MSVC and MinGW. */
+static const GUID folder_profile = {
+    0x5E6C858F,
+    0x0E22,
+    0x4760,
+    {0x9A, 0xFE, 0xEA, 0x33, 0x17, 0xB6, 0x71, 0x73}};
+static const GUID folder_roaming = {
+    0x3EB685DB,
+    0x65F9,
+    0x4CF6,
+    {0xA0, 0x3A, 0xE3, 0xEF, 0x65, 0x72, 0x9F, 0x3D}};
+static const GUID folder_local = {
+    0xF1B32785,
+    0x6FBA,
+    0x4FCF,
+    {0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91}};
+
+fs_err_t fs_cwd(strbuf_t *out)
+{
+    if (!out)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    wchar_t w[WPATH_MAX];
+    DWORD n = GetCurrentDirectoryW(WPATH_MAX, w);
+    if (n == 0)
+    {
+        return last_err();
+    }
+    if (n >= WPATH_MAX)
+    {
+        return (fs_err_t){FS_ERR_NAME_TOO_LONG, 0};
+    }
+    return append_canonical(w, n, out);
+}
+
+fs_err_t fs_location(fs_loc_t loc, strbuf_t *out)
+{
+    if (!out || (unsigned)loc > (unsigned)FS_LOC_DATA)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    if (loc == FS_LOC_TEMP)
+    {
+        wchar_t w[WPATH_MAX];
+        DWORD n = GetTempPathW(WPATH_MAX, w);
+        if (n == 0 || n >= WPATH_MAX)
+        {
+            return n ? (fs_err_t){FS_ERR_NAME_TOO_LONG, 0} : last_err();
+        }
+        /* GetTempPathW may give an 8.3 name ("RUNNER~1"): the long one. */
+        DWORD m = GetLongPathNameW(w, w, WPATH_MAX);
+        if (m > 0 && m < WPATH_MAX)
+        {
+            n = m;
+        }
+        return append_canonical(w, n, out);
+    }
+
+    const GUID *id = loc == FS_LOC_HOME     ? &folder_profile
+                     : loc == FS_LOC_CONFIG ? &folder_roaming
+                                            : &folder_local;
+    PWSTR p = NULL;
+    HRESULT hr = SHGetKnownFolderPath(id, 0, NULL, &p);
+    if (FAILED(hr))
+    {
+        CoTaskMemFree(p);
+        return (fs_err_t){FS_ERR_NOT_FOUND, (int32_t)hr};
+    }
+    fs_err_t err = append_canonical(p, wcslen(p), out);
+    CoTaskMemFree(p);
+    return err;
+}
+
+fs_err_t fs_from_native(string_t native, strbuf_t *out)
+{
+    if (!out || native.len == 0 || memchr(native.ptr, '\0', native.len)
+        || native.len >= WPATH_MAX)
+    {
+        return native.len >= WPATH_MAX ? (fs_err_t){FS_ERR_NAME_TOO_LONG, 0}
+                                       : (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    wchar_t w[WPATH_MAX];
+    int units = MultiByteToWideChar(
+        CP_UTF8,
+        MB_ERR_INVALID_CHARS,
+        native.ptr,
+        (int)native.len,
+        w,
+        WPATH_MAX - 1);
+    if (units <= 0)
+    {
+        return (fs_err_t){FS_ERR_INVALID, (int32_t)GetLastError()};
+    }
+    w[units] = L'\0';
+    wchar_t full[WPATH_MAX];
+    DWORD n = GetFullPathNameW(w, WPATH_MAX, full, NULL);
+    if (n == 0)
+    {
+        return last_err();
+    }
+    if (n >= WPATH_MAX)
+    {
+        return (fs_err_t){FS_ERR_NAME_TOO_LONG, 0};
+    }
+    return append_canonical(full, n, out);
+}

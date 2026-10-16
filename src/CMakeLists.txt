@@ -14,6 +14,8 @@ if(WIN32)
     target_sources(filec PRIVATE
         win32/fs_win32.c
     )
+    # SHGetKnownFolderPath (shell32) and CoTaskMemFree (ole32)
+    target_link_libraries(filec PRIVATE shell32 ole32)
 else()
     target_sources(filec PRIVATE
         posix/fs_posix.c

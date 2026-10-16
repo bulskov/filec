@@ -5,7 +5,8 @@
  * mkdir, remove, stat, exists): tests/fs_basic_test.c.  Step 2 (files):
  * tests/fs_file_test.c.  Step 3 (reading directories):
  * tests/fs_dir_test.c.  Step 4 (mkdir_all, rename, copy_file, read_link,
- * real_path): tests/fs_ops_test.c.
+ * real_path): tests/fs_ops_test.c.  Step 5 (cwd, location, from_native):
+ * tests/fs_places_test.c.
  *
  * Paths:     every path in and out is CANONICAL, normalised and ABSOLUTE
  *            (see filec/path.h): "/C:/Users/me", not "C:\Users\me".  A
@@ -359,15 +360,41 @@ typedef enum
     FS_LOC_DATA,
 } fs_loc_t;
 
-/* XDG base directories / Windows Known Folders, appended to out. */
+/* Where things go, appended to out: canonical, absolute, normalised.  The
+ * directory need not exist yet (~/.cache on a new account) — create it
+ * with fs_mkdir_all when you need it.
+ *
+ *              Linux, BSD (XDG)         macOS                    Windows
+ *   HOME       $HOME                    $HOME                    Profile
+ *   TEMP       $TMPDIR, /tmp            $TMPDIR, /tmp            GetTempPathW
+ *   CONFIG     $XDG_CONFIG_HOME,        ~/Library/Application    RoamingAppData
+ *              ~/.config                Support
+ *   CACHE      $XDG_CACHE_HOME,         ~/Library/Caches         LocalAppData
+ *              ~/.cache
+ *   DATA       $XDG_DATA_HOME,          ~/Library/Application    LocalAppData
+ *              ~/.local/share           Support
+ *
+ * An environment variable counts only if it holds an absolute path (the
+ * XDG spec says to ignore a relative one); without $HOME the password
+ * database is asked.  A loc out of range: FS_ERR_INVALID.  On failure out
+ * is unchanged. */
 FS_NODISCARD fs_err_t fs_location(fs_loc_t loc, strbuf_t *out);
+
+/* The process's current directory, appended to out (canonical).  Only for
+ * resolving what a user typed (fs_from_native does that) — every other fs
+ * function wants absolute paths, because the current directory is shared
+ * by all threads. */
 FS_NODISCARD fs_err_t fs_cwd(strbuf_t *out);
 
 /* Any native path the OS would accept -> canonical, absolute, normalised,
  * appended to out.  Unlike path_from_native (filec/native.h), relative
  * forms are resolved against the real current directory, including
  * Windows' "C:x" (drive C's current directory) and "\x" (root of the
- * current drive).  For paths typed by a user or given on a command line. */
+ * current drive), and Windows' own rules apply there (trailing dots and
+ * spaces of a name are dropped, '/' works like '\').  "~" is not
+ * expanded — that is the shell's job.  For paths typed by a user or given
+ * on a command line.  Empty, or a NUL byte: FS_ERR_INVALID.  The path
+ * need not exist.  On failure out is unchanged. */
 FS_NODISCARD fs_err_t fs_from_native(string_t native, strbuf_t *out);
 
 typedef struct
