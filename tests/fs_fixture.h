@@ -27,7 +27,8 @@
  *   fx_write_bytes(rel, p, n)    create a file with n bytes of binary data
  *   fx_exists(rel), fx_is_dir    without following a link
  *   fx_set_mtime(rel, secs)      the modification time, seconds since 1970
- *   fx_mode(rel)                 POSIX permission bits; -1 on Windows */
+ *   fx_mode(rel)                 POSIX permission bits; -1 on Windows
+ *   fx_is_wine()                 running under Wine, not Windows */
 
 #ifndef _WIN32
 #define _XOPEN_SOURCE 700
@@ -283,6 +284,14 @@ static inline FILE *fx_fopen(const char *native, const char *mode)
     return _wfsopen(fx_wide(native), fx_wide(mode), _SH_DENYNO);
 }
 
+/* Running under Wine (ntdll exports wine_get_version): for the few
+ * places where Wine does not behave like Windows. */
+static inline bool fx_is_wine(void)
+{
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll && GetProcAddress(ntdll, "wine_get_version");
+}
+
 static inline DWORD fx_attrs(const char *rel)
 {
     return GetFileAttributesW(fx_wide(fx_native(FX(rel))));
@@ -416,6 +425,11 @@ static inline int fx_count_entries(const char *rel)
 static inline FILE *fx_fopen(const char *native, const char *mode)
 {
     return fopen(native, mode);
+}
+
+static inline bool fx_is_wine(void)
+{
+    return false;
 }
 
 static inline bool fx_exists(const char *rel)

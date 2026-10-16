@@ -1084,6 +1084,16 @@ fs_err_t fs_rename(string_t from, string_t to, uint32_t flags)
             return (fs_err_t){FS_ERR_EXISTS, 0};
         }
     }
+    else
+    {
+        /* A file on the way to to: Windows answers with codes that do not
+         * say so (and differ between versions); look instead. */
+        fs_err_t way = not_dir_on_the_way(to, (fs_err_t){FS_ERR_NOT_FOUND, 0});
+        if (way.kind == FS_ERR_NOT_DIR)
+        {
+            return way;
+        }
+    }
 
     /* No MOVEFILE_COPY_ALLOWED: across volumes is FS_ERR_CROSS_DEVICE. */
     DWORD mf = (flags & FS_REPLACE) ? MOVEFILE_REPLACE_EXISTING : 0;
