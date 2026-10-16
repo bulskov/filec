@@ -1015,3 +1015,138 @@ fs_err_t fs_real_path(string_t path, strbuf_t *out)
         return (fs_err_t){FS_ERR_INVALID, 0};
     }
 }
+
+/* --- Places (step 5, tests/fs_places_test.c) ----------------------------- */
+
+#include <pwd.h>
+
+/* A native POSIX path (absolute) -> canonical, appended to out. */
+static fs_err_t append_from_native(string_t native, strbuf_t *out)
+{
+    switch (path_from_native(native, PATH_STYLE_POSIX, out))
+    {
+    case PATH_NATIVE_OK:
+        return posix_ok;
+    case PATH_NATIVE_OOM:
+        return (fs_err_t){FS_ERR_OOM, 0};
+    default:
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+}
+
+fs_err_t fs_cwd(strbuf_t *out)
+{
+    if (!out)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    char buf[FILEC_PATH_BUF_MAX];
+    if (!getcwd(buf, sizeof buf))
+    {
+        return errno == ERANGE ? (fs_err_t){FS_ERR_NAME_TOO_LONG, ERANGE}
+                               : filec_from_errno(errno);
+    }
+    return append_from_native(string_view_cstr(buf), out);
+}
+
+/* An environment variable that holds an absolute path, or NULL. */
+static const char *absolute_env(const char *name)
+{
+    const char *v = getenv(name);
+    return v && v[0] == '/' ? v : NULL;
+}
+
+/* The home directory into buf: $HOME, or the password database. */
+static fs_err_t home_dir(char *buf, size_t size)
+{
+    const char *home = absolute_env("HOME");
+    char pwbuf[16 * 1024];
+    if (!home)
+    {
+        struct passwd pw, *found = NULL;
+        int e = getpwuid_r(getuid(), &pw, pwbuf, sizeof pwbuf, &found);
+        if (e != 0 || !found || !pw.pw_dir || pw.pw_dir[0] != '/')
+        {
+            return e != 0 ? filec_from_errno(e)
+                          : (fs_err_t){FS_ERR_NOT_FOUND, 0};
+        }
+        home = pw.pw_dir;
+    }
+    if ((size_t)snprintf(buf, size, "%s", home) >= size)
+    {
+        return (fs_err_t){FS_ERR_NAME_TOO_LONG, 0};
+    }
+    return posix_ok;
+}
+
+fs_err_t fs_location(fs_loc_t loc, strbuf_t *out)
+{
+    if (!out || (unsigned)loc > (unsigned)FS_LOC_DATA)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    if (loc == FS_LOC_TEMP)
+    {
+        const char *tmp = absolute_env("TMPDIR");
+        return append_from_native(string_view_cstr(tmp ? tmp : "/tmp"), out);
+    }
+
+#ifndef __APPLE__
+    /* XDG base directories: an absolute $XDG_*_HOME wins */
+    const char *xdg = loc == FS_LOC_CONFIG  ? absolute_env("XDG_CONFIG_HOME")
+                      : loc == FS_LOC_CACHE ? absolute_env("XDG_CACHE_HOME")
+                      : loc == FS_LOC_DATA  ? absolute_env("XDG_DATA_HOME")
+                                            : NULL;
+    if (xdg)
+    {
+        return append_from_native(string_view_cstr(xdg), out);
+    }
+#endif
+
+    char home[FILEC_PATH_BUF_MAX];
+    fs_err_t err = home_dir(home, sizeof home);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+#ifdef __APPLE__
+    const char *under = loc == FS_LOC_CACHE  ? "Library/Caches"
+                        : loc == FS_LOC_HOME ? ""
+                                             : "Library/Application Support";
+#else
+    const char *under = loc == FS_LOC_CONFIG  ? ".config"
+                        : loc == FS_LOC_CACHE ? ".cache"
+                        : loc == FS_LOC_DATA  ? ".local/share"
+                                              : "";
+#endif
+    char buf[2 * FILEC_PATH_BUF_MAX];
+    snprintf(buf, sizeof buf, "%s/%s", home, under);
+    return append_from_native(string_view_cstr(buf), out);
+}
+
+fs_err_t fs_from_native(string_t native, strbuf_t *out)
+{
+    if (!out || native.len == 0 || memchr(native.ptr, '\0', native.len))
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    if (native.ptr[0] == '/')
+    {
+        return append_from_native(native, out);
+    }
+    /* relative: against the current directory, then normalised */
+    char buf[2 * FILEC_PATH_BUF_MAX + 2];
+    if (!getcwd(buf, FILEC_PATH_BUF_MAX))
+    {
+        return errno == ERANGE ? (fs_err_t){FS_ERR_NAME_TOO_LONG, ERANGE}
+                               : filec_from_errno(errno);
+    }
+    size_t n = strlen(buf);
+    if (n + 1 + native.len >= sizeof buf)
+    {
+        return (fs_err_t){FS_ERR_NAME_TOO_LONG, 0};
+    }
+    buf[n++] = '/';
+    memcpy(buf + n, native.ptr, native.len);
+    return append_from_native((string_t){buf, n + native.len}, out);
+}
