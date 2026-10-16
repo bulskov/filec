@@ -3,7 +3,8 @@
  *
  * STATUS: being implemented step by step — see README.md.  Step 1 (errors,
  * mkdir, remove, stat, exists): tests/fs_basic_test.c.  Step 2 (files):
- * tests/fs_file_test.c.
+ * tests/fs_file_test.c.  Step 3 (reading directories):
+ * tests/fs_dir_test.c.
  *
  * Paths:     every path in and out is CANONICAL, normalised and ABSOLUTE
  *            (see filec/path.h): "/C:/Users/me", not "C:\Users\me".  A
@@ -18,16 +19,20 @@
  * Errors:    every function that can fail returns fs_err_t; results come
  *            back through out-parameters.  FS_NODISCARD makes ignoring the
  *            error a compiler warning.
- * Strings:   results that are strings APPEND to a strbuf_t you own, as in
- *            filec/path.h; on failure out is unchanged.  Names in directory
- *            listings and watch events are views, valid until the next
- *            read — copy what you keep.
+ * Memory:    the caller decides, and is responsible.  Results are
+ *            appended to a strbuf_t or vec_t you own (on failure out is
+ *            unchanged), or allocated from an allocator you pass — then they
+ *            live as long as that allocator: filec never frees what it hands
+ *            you.  Pass an arena and reset it when you are done.  What filec
+ *            needs only while it works (an iterator's state) it gives back.
+ *            Names in streamed listings (fs_dir_iter) and watch events are
+ *            views, valid until the next step — copy what you keep.
  * Names out: raw bytes.  On Linux they may be invalid UTF-8; nothing is
  *            "fixed" here — sanitising for display is the caller's job.
  * Blocking:  every function may block on I/O.  Call them from worker threads
  *            if you have a UI.
  * Threads:   functions are safe to call concurrently on different objects.
- *            An fs_dir_t is single-owner.  Positional file I/O (fs_read_at /
+ *            An iterator is single-owner.  Positional file I/O (fs_read_at /
  *            fs_write_at) may run concurrently on the same file. */
 
 #include <stdatomic.h>
@@ -136,26 +141,45 @@ typedef struct
 } fs_entry_t;
 
 /* --- Reading directories ------------------------------------------------- */
-/* "." and ".." are never returned.  Order is unspecified. */
+/* "." and ".." are never returned; everything else is, hidden entries
+ * included.  Order is unspecified.
+ *
+ * Entries describe themselves, like fs_stat with FS_NOFOLLOW: a link is
+ * FS_KIND_LINK (a dangling one too), never what it points to.  The
+ * directory path itself IS followed: listing a link to a directory lists
+ * the directory.
+ *
+ * want works as in fs_stat: every field asked for is in valid (FS_F_BTIME
+ * where the filesystem has it), with the value fs_stat(FS_NOFOLLOW) would
+ * give.  What the listing gets for free may be there too (the kind from
+ * getdents, size and times from FindFirstFileW) — check valid. */
 
-typedef struct fs_dir_t fs_dir_t;
-
-/* One allocation from a, for the directory and its buffer. */
+/* The whole listing, appended to out — a vec_t of fs_entry_t you created
+ * (another elem_size is FS_ERR_INVALID).  Each name is allocated from a and
+ * lives as long as a: keep the entries, sort them, show them.
+ *
+ * On failure out is unchanged; names already allocated from a stay there
+ * until you reset it.  Missing: FS_ERR_NOT_FOUND; a file (or a file on the
+ * way): FS_ERR_NOT_DIR; a or out cannot grow: FS_ERR_OOM.  An entry that
+ * vanished between listing and stat is skipped, not an error.
+ *
+ * The entries and the names may share one arena; with two (one for out,
+ * one for a), growing out wastes nothing. */
 FS_NODISCARD fs_err_t
-fs_dir_open(string_t path, uint32_t want, allocator_t a, fs_dir_t **out);
+fs_dir_list(string_t path, uint32_t want, allocator_t a, vec_t *out);
 
-/* Fills up to cap entries and sets *count; 0 means end of directory.  The
- * names are views into d, valid until the next fs_dir_read or
- * fs_dir_close.  An entry that vanished between listing and stat is
- * skipped, not an error. */
-FS_NODISCARD fs_err_t
-fs_dir_read(fs_dir_t *d, fs_entry_t *out, size_t cap, size_t *count);
-
-void fs_dir_close(fs_dir_t *d); /* NULL is a no-op */
-
-/* Convenience: iter_t yielding fs_entry_t (names valid until the next
- * step).  iter_t has no error channel, so errors — opening or mid-way —
- * stop the iteration and are written to *err: check it after the loop. */
+/* The listing as a stream: an iter_t yielding fs_entry_t, in constant
+ * memory however long the directory is.  Each name is a view, valid until
+ * the next step — copy what you keep.  The iterator's state comes from a
+ * and goes back when the iterator ends (a terminal, or iter_destroy after
+ * a loop of your own over iter_next, finished or not).
+ *
+ * Errors follow seqc's convention for sources that can fail: iter_t has no
+ * error channel, so an error — opening or half-way — ends the iteration and
+ * is written to *err (FS_OK after a complete listing).  Check it after the
+ * loop.  If the directory cannot be opened the result is a failed iterator
+ * (iter_is_valid is false), safe to hand to any adaptor or terminal.  err
+ * may be NULL if you do not care. */
 iter_t fs_dir_iter(string_t path, uint32_t want, allocator_t a, fs_err_t *err);
 
 /* --- Metadata ------------------------------------------------------------ */

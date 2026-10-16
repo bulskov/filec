@@ -12,6 +12,16 @@
             "preLaunchTask": "Build path_test (debug)"
         },
         {
+            "name": "Debug native tests (LLDB)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/debug/tests/native_test",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "terminal": "integrated",
+            "preLaunchTask": "Build native_test (debug)"
+        },
+        {
             "name": "Debug smoke tests (LLDB)",
             "type": "lldb",
             "request": "launch",

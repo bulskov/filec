@@ -18,6 +18,7 @@
  *   fx_symlink(target, rel)      create a symlink; false where the OS does
  *                                not allow it (Windows without developer
  *                                mode) — tests then skip that part
+ *   fx_symlink_dir(target, rel)  the same, for a target that is a directory
  *   fx_set_hidden(rel)           Windows hidden attribute; false on POSIX
  *   fx_read_file(rel, &len)      the contents of a file (static buffer,
  *                                up to 64 KiB), NULL if it cannot be read
@@ -210,7 +211,8 @@ static inline bool fx_mkdir(const char *rel)
     return CreateDirectoryW(fx_wide(fx_native(FX(rel))), NULL);
 }
 
-static inline bool fx_symlink(const char *target, const char *rel)
+static inline bool fx_symlink_flags(
+    const char *target, const char *rel, DWORD flags)
 {
     /* target relative to the link's directory, as POSIX symlink() takes */
     char t[8192];
@@ -222,8 +224,21 @@ static inline bool fx_symlink(const char *target, const char *rel)
             *p = '\\';
         }
     }
-    DWORD flags = 0x2; /* SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE */
+    flags |= 0x2; /* SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE */
     return CreateSymbolicLinkW(fx_wide(fx_native(FX(rel))), fx_wide(t), flags);
+}
+
+static inline bool fx_symlink(const char *target, const char *rel)
+{
+    return fx_symlink_flags(target, rel, 0);
+}
+
+/* Windows fixes a link's kind when it is made: only a directory link can
+ * be listed through. */
+static inline bool fx_symlink_dir(const char *target, const char *rel)
+{
+    return fx_symlink_flags(
+        target, rel, 0x1); /* SYMBOLIC_LINK_FLAG_DIRECTORY */
 }
 
 static inline bool fx_set_hidden(const char *rel)
@@ -314,6 +329,11 @@ static inline bool fx_mkdir(const char *rel)
 static inline bool fx_symlink(const char *target, const char *rel)
 {
     return symlink(target, fx_native(FX(rel))) == 0;
+}
+
+static inline bool fx_symlink_dir(const char *target, const char *rel)
+{
+    return fx_symlink(target, rel);
 }
 
 static inline bool fx_set_hidden(const char *rel)
