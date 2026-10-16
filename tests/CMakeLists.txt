@@ -15,3 +15,7 @@ filec_test(fs_dir)
 filec_test(fs_ops)
 filec_test(fs_places)
 filec_test(fs_volume)
+filec_test(fs_watch)
+# the wake test starts a thread
+find_package(Threads REQUIRED)
+target_link_libraries(fs_watch_test PRIVATE Threads::Threads)

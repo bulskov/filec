@@ -1499,3 +1499,496 @@ fs_err_t fs_space(string_t path, uint64_t *total, uint64_t *avail)
     }
     return posix_ok;
 }
+
+/* --- Watching (step 7, tests/fs_watch_test.c) ----------------------------- */
+
+static bool wait_args_ok(
+    fs_watch_t *w, fs_watch_event_t *out, size_t cap, size_t *count)
+{
+    if (count)
+    {
+        *count = 0;
+    }
+    return w && out && cap > 0 && count;
+}
+
+#if defined(__linux__)
+
+/* inotify for the events, an eventfd for fs_watch_wake; one poll waits
+ * for both.  The kernel hands over many events per read: what does not
+ * fit into the caller's array stays in buf for the next fs_watch_wait,
+ * and the names point into buf. */
+
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <sys/inotify.h>
+
+#define WATCH_MASK                                                             \
+    (IN_CREATE | IN_DELETE | IN_MODIFY | IN_ATTRIB | IN_MOVED_FROM             \
+     | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR)
+
+struct fs_watch_t
+{
+    allocator_t a;
+    int ino;         /* inotify */
+    int wake;        /* eventfd */
+    size_t pos, len; /* unread events in buf */
+    _Alignas(struct inotify_event) char buf[64 * 1024];
+};
+
+fs_err_t fs_watch_create(allocator_t a, fs_watch_t **out)
+{
+    if (!out)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    *out = NULL;
+    fs_watch_t *w = mem_alloc(a, sizeof *w, _Alignof(fs_watch_t));
+    if (!w)
+    {
+        return (fs_err_t){FS_ERR_OOM, 0};
+    }
+    w->a = a;
+    w->pos = w->len = 0;
+    w->ino = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    w->wake = w->ino < 0 ? -1 : eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (w->ino < 0 || w->wake < 0)
+    {
+        fs_err_t err = filec_from_errno(errno);
+        if (w->ino >= 0)
+        {
+            close(w->ino);
+        }
+        mem_free(a, w, sizeof *w);
+        return err;
+    }
+    *out = w;
+    return posix_ok;
+}
+
+fs_err_t fs_watch_add(fs_watch_t *w, string_t dir, uint32_t *id)
+{
+    if (!w || !id)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    char buf[FILEC_PATH_BUF_MAX];
+    fs_err_t err = filec_path_cstr(dir, buf, sizeof buf);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    int wd = inotify_add_watch(w->ino, buf, WATCH_MASK);
+    if (wd < 0)
+    {
+        return filec_from_errno(errno); /* ENOTDIR from IN_ONLYDIR */
+    }
+    *id = (uint32_t)wd; /* watch descriptors start at 1 */
+    return posix_ok;
+}
+
+void fs_watch_remove(fs_watch_t *w, uint32_t watch_id)
+{
+    if (w && watch_id != 0)
+    {
+        inotify_rm_watch(w->ino, (int)watch_id);
+    }
+}
+
+/* The next unread event in buf as an fs_watch_event_t; false if it is
+ * one to skip (IN_IGNORED, which follows a removal). */
+static bool next_event(fs_watch_t *w, fs_watch_event_t *e)
+{
+    const struct inotify_event *ev =
+        (const struct inotify_event *)(w->buf + w->pos);
+    w->pos += sizeof *ev + ev->len;
+
+    e->watch_id = (uint32_t)ev->wd;
+    e->name = ev->len ? string_view_cstr(ev->name) : (string_t){"", 0};
+    uint32_t m = ev->mask;
+    if (m & IN_Q_OVERFLOW)
+    {
+        e->kind = FS_W_OVERFLOW;
+        e->watch_id = 0;
+    }
+    else if (m & (IN_DELETE_SELF | IN_MOVE_SELF))
+    {
+        e->kind = FS_W_DELETED;
+        e->name = (string_t){"", 0};
+    }
+    else if (m & IN_CREATE)
+    {
+        e->kind = FS_W_CREATED;
+    }
+    else if (m & IN_DELETE)
+    {
+        e->kind = FS_W_DELETED;
+    }
+    else if (m & (IN_MOVED_FROM | IN_MOVED_TO))
+    {
+        e->kind = FS_W_RENAMED;
+    }
+    else if (m & (IN_MODIFY | IN_ATTRIB))
+    {
+        e->kind = FS_W_MODIFIED;
+    }
+    else
+    {
+        return false; /* IN_IGNORED */
+    }
+    return true;
+}
+
+fs_err_t fs_watch_wait(
+    fs_watch_t *w,
+    fs_watch_event_t *out,
+    size_t cap,
+    uint32_t timeout_ms,
+    size_t *count)
+{
+    if (!wait_args_ok(w, out, cap, count))
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;)
+    {
+        while (w->pos < w->len && *count < cap)
+        {
+            if (next_event(w, &out[*count]))
+            {
+                (*count)++;
+            }
+        }
+        if (*count > 0)
+        {
+            return posix_ok;
+        }
+
+        /* nothing unread: wait for the kernel, a wake, or the time */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t spent = (int64_t)(now.tv_sec - start.tv_sec) * 1000
+                        + (now.tv_nsec - start.tv_nsec) / 1000000;
+        int left = spent >= (int64_t)timeout_ms ? 0 : (int)(timeout_ms - spent);
+        struct pollfd p[2] = {{w->ino, POLLIN, 0}, {w->wake, POLLIN, 0}};
+        int r = poll(p, 2, left);
+        if (r < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (r < 0)
+        {
+            return filec_from_errno(errno);
+        }
+        if (p[1].revents & POLLIN)
+        {
+            uint64_t n;
+            ssize_t got = read(w->wake, &n, sizeof n); /* reset to 0 */
+            (void)got;
+            return posix_ok;
+        }
+        if (r == 0)
+        {
+            return posix_ok; /* the time is up */
+        }
+        ssize_t n = read(w->ino, w->buf, sizeof w->buf);
+        if (n < 0 && errno != EAGAIN && errno != EINTR)
+        {
+            return filec_from_errno(errno);
+        }
+        w->pos = 0;
+        w->len = n > 0 ? (size_t)n : 0;
+    }
+}
+
+void fs_watch_wake(fs_watch_t *w)
+{
+    if (w)
+    {
+        uint64_t one = 1;
+        ssize_t n = write(w->wake, &one, sizeof one);
+        (void)n;
+    }
+}
+
+void fs_watch_destroy(fs_watch_t *w)
+{
+    if (w)
+    {
+        close(w->ino);
+        close(w->wake);
+        mem_free(w->a, w, sizeof *w);
+    }
+}
+
+#elif defined(__APPLE__)
+
+/* kqueue: one EVFILT_VNODE per watched directory (opened with
+ * O_EVTONLY, so it does not keep a volume from being ejected), and an
+ * EVFILT_USER event for fs_watch_wake.  kqueue says that a directory
+ * changed, not what: FS_W_MODIFIED with the name "". */
+
+#include <pthread.h>
+#include <sys/event.h>
+
+typedef struct
+{
+    int fd;
+    uint32_t id;
+} kq_watch_t;
+
+struct fs_watch_t
+{
+    allocator_t a;
+    int kq;
+    pthread_mutex_t lock; /* watches, n, cap, next_id */
+    kq_watch_t *watches;
+    size_t n, cap;
+    uint32_t next_id;
+};
+
+#define WAKE_IDENT 1
+
+fs_err_t fs_watch_create(allocator_t a, fs_watch_t **out)
+{
+    if (!out)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    *out = NULL;
+    fs_watch_t *w = mem_alloc(a, sizeof *w, _Alignof(fs_watch_t));
+    if (!w)
+    {
+        return (fs_err_t){FS_ERR_OOM, 0};
+    }
+    memset(w, 0, sizeof *w);
+    w->a = a;
+    w->kq = kqueue();
+    if (w->kq < 0)
+    {
+        fs_err_t err = filec_from_errno(errno);
+        mem_free(a, w, sizeof *w);
+        return err;
+    }
+    struct kevent ev;
+    EV_SET(&ev, WAKE_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    if (kevent(w->kq, &ev, 1, NULL, 0, NULL) < 0)
+    {
+        fs_err_t err = filec_from_errno(errno);
+        close(w->kq);
+        mem_free(a, w, sizeof *w);
+        return err;
+    }
+    pthread_mutex_init(&w->lock, NULL);
+    *out = w;
+    return posix_ok;
+}
+
+fs_err_t fs_watch_add(fs_watch_t *w, string_t dir, uint32_t *id)
+{
+    if (!w || !id)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    char buf[FILEC_PATH_BUF_MAX];
+    fs_err_t err = filec_path_cstr(dir, buf, sizeof buf);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    int fd = open(buf, O_EVTONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        return filec_from_errno(errno);
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode))
+    {
+        close(fd);
+        return (fs_err_t){FS_ERR_NOT_DIR, ENOTDIR};
+    }
+
+    pthread_mutex_lock(&w->lock);
+    if (w->n == w->cap)
+    {
+        size_t cap = w->cap ? 2 * w->cap : 8;
+        kq_watch_t *grown = mem_realloc(
+            w->a,
+            w->watches,
+            w->cap * sizeof *grown,
+            cap * sizeof *grown,
+            _Alignof(kq_watch_t));
+        if (!grown)
+        {
+            pthread_mutex_unlock(&w->lock);
+            close(fd);
+            return (fs_err_t){FS_ERR_OOM, 0};
+        }
+        w->watches = grown;
+        w->cap = cap;
+    }
+    uint32_t new_id = ++w->next_id;
+    struct kevent ev;
+    EV_SET(
+        &ev,
+        (uintptr_t)fd,
+        EVFILT_VNODE,
+        EV_ADD | EV_CLEAR,
+        NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_DELETE | NOTE_RENAME
+            | NOTE_REVOKE,
+        0,
+        (void *)(uintptr_t)new_id);
+    if (kevent(w->kq, &ev, 1, NULL, 0, NULL) < 0)
+    {
+        err = filec_from_errno(errno);
+        pthread_mutex_unlock(&w->lock);
+        close(fd);
+        return err;
+    }
+    w->watches[w->n++] = (kq_watch_t){fd, new_id};
+    pthread_mutex_unlock(&w->lock);
+    *id = new_id;
+    return posix_ok;
+}
+
+void fs_watch_remove(fs_watch_t *w, uint32_t watch_id)
+{
+    if (!w)
+    {
+        return;
+    }
+    pthread_mutex_lock(&w->lock);
+    for (size_t i = 0; i < w->n; i++)
+    {
+        if (w->watches[i].id == watch_id)
+        {
+            close(w->watches[i].fd); /* removes its kevent too */
+            w->watches[i] = w->watches[--w->n];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&w->lock);
+}
+
+fs_err_t fs_watch_wait(
+    fs_watch_t *w,
+    fs_watch_event_t *out,
+    size_t cap,
+    uint32_t timeout_ms,
+    size_t *count)
+{
+    if (!wait_args_ok(w, out, cap, count))
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    struct kevent evs[64];
+    int max = cap < 64 ? (int)cap : 64;
+    struct timespec ts = {
+        (time_t)(timeout_ms / 1000), (long)(timeout_ms % 1000) * 1000000};
+    int n;
+    do
+    {
+        n = kevent(w->kq, NULL, 0, evs, max, &ts);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0)
+    {
+        return filec_from_errno(errno);
+    }
+    for (int i = 0; i < n; i++)
+    {
+        if (evs[i].filter == EVFILT_USER)
+        {
+            continue; /* a wake: count stays as it is */
+        }
+        fs_watch_event_t *e = &out[(*count)++];
+        e->watch_id = (uint32_t)(uintptr_t)evs[i].udata;
+        e->name = (string_t){"", 0};
+        e->kind = (evs[i].fflags & (NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE))
+                      ? FS_W_DELETED
+                      : FS_W_MODIFIED;
+    }
+    return posix_ok;
+}
+
+void fs_watch_wake(fs_watch_t *w)
+{
+    if (w)
+    {
+        struct kevent ev;
+        EV_SET(&ev, WAKE_IDENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+        kevent(w->kq, &ev, 1, NULL, 0, NULL);
+    }
+}
+
+void fs_watch_destroy(fs_watch_t *w)
+{
+    if (w)
+    {
+        for (size_t i = 0; i < w->n; i++)
+        {
+            close(w->watches[i].fd);
+        }
+        mem_free(w->a, w->watches, w->cap * sizeof *w->watches);
+        close(w->kq);
+        pthread_mutex_destroy(&w->lock);
+        mem_free(w->a, w, sizeof *w);
+    }
+}
+
+#else
+
+fs_err_t fs_watch_create(allocator_t a, fs_watch_t **out)
+{
+    (void)a;
+    if (out)
+    {
+        *out = NULL;
+    }
+    return (fs_err_t){FS_ERR_UNSUPPORTED, 0};
+}
+
+fs_err_t fs_watch_add(fs_watch_t *w, string_t dir, uint32_t *id)
+{
+    (void)w;
+    (void)dir;
+    (void)id;
+    return (fs_err_t){FS_ERR_UNSUPPORTED, 0};
+}
+
+void fs_watch_remove(fs_watch_t *w, uint32_t watch_id)
+{
+    (void)w;
+    (void)watch_id;
+}
+
+fs_err_t fs_watch_wait(
+    fs_watch_t *w,
+    fs_watch_event_t *out,
+    size_t cap,
+    uint32_t timeout_ms,
+    size_t *count)
+{
+    (void)w;
+    (void)out;
+    (void)cap;
+    (void)timeout_ms;
+    if (count)
+    {
+        *count = 0;
+    }
+    return (fs_err_t){FS_ERR_UNSUPPORTED, 0};
+}
+
+void fs_watch_wake(fs_watch_t *w)
+{
+    (void)w;
+}
+
+void fs_watch_destroy(fs_watch_t *w)
+{
+    (void)w;
+}
+
+#endif
