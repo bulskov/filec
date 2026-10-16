@@ -1,13 +1,12 @@
 #pragma once
 /* filec/fs — filesystem access.  POSIX (Linux, macOS) and Win32 backends.
  *
- * STATUS: being implemented step by step — see README.md.  Step 1 (errors,
- * mkdir, remove, stat, exists): tests/fs_basic_test.c.  Step 2 (files):
- * tests/fs_file_test.c.  Step 3 (reading directories):
- * tests/fs_dir_test.c.  Step 4 (mkdir_all, rename, copy_file, read_link,
- * real_path): tests/fs_ops_test.c.  Step 5 (cwd, location, from_native):
- * tests/fs_places_test.c.  Step 6 (volumes, space): tests/fs_volume_test.c.
- * Step 7 (watching): tests/fs_watch_test.c.
+ * Every function here works on Linux, macOS and Windows.  The tests, by
+ * area: errors, mkdir, remove, stat, exists (tests/fs_basic_test.c);
+ * files (fs_file_test.c); reading directories (fs_dir_test.c); mkdir_all,
+ * rename, copy_file, read_link, real_path (fs_ops_test.c); cwd, location,
+ * from_native (fs_places_test.c); volumes, space (fs_volume_test.c);
+ * watching (fs_watch_test.c); trash (fs_trash_test.c).
  *
  * Paths:     every path in and out is CANONICAL, normalised and ABSOLUTE
  *            (see filec/path.h): "/C:/Users/me", not "C:\Users\me".  A
@@ -346,8 +345,21 @@ FS_NODISCARD fs_err_t fs_rename(string_t from, string_t to, uint32_t flags);
 FS_NODISCARD fs_err_t
 fs_copy_file(string_t from, string_t to, uint32_t flags, const fs_op_t *op);
 
-/* XDG trash spec on Linux (home trash, or $topdir/.Trash-$uid on other
- * volumes), Recycle Bin on Windows. */
+/* Moves a file, link (not its target) or directory (with everything in
+ * it) to the trash, where the user can get it back:
+ *
+ *   Linux    the XDG trash spec: $XDG_DATA_HOME/Trash (~/.local/share/
+ *            Trash) for the home volume, $topdir/.Trash/$uid or
+ *            $topdir/.Trash-$uid on others; with a .trashinfo, so file
+ *            managers can restore it
+ *   macOS    ~/.Trash, or $topdir/.Trashes/$uid on other volumes
+ *   Windows  the Recycle Bin (fixed drives only)
+ *
+ * A name already in the trash gets a suffix; nothing there is replaced.
+ * It never copies: where there is no trash on the same volume (a network
+ * or removable drive on Windows, a volume where none can be made):
+ * FS_ERR_UNSUPPORTED, and NOTHING is deleted — ask the user, then
+ * fs_remove.  Missing: FS_ERR_NOT_FOUND. */
 FS_NODISCARD fs_err_t fs_trash(string_t path);
 
 /* --- Locations and volumes ----------------------------------------------- */

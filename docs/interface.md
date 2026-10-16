@@ -130,14 +130,20 @@ ignored error a warning — the useful part of C++'s `expected`. A generic
 result type would need a struct per result type and macros, and without
 lambdas there is no chaining to gain. `fs_ok(e)` is the short test.
 
-### Strings out (decided)
+### Memory: the caller decides, and is responsible (decided)
 
-Results that are strings (`fs_read_link`, `fs_real_path`, `fs_cwd`,
-`fs_location`, `fs_from_native`, `fs_read_all`) **append to a `strbuf_t`**
-the caller owns, as in `path`. Names in directory listings and watch events
-are **views** into the `fs_dir_t` / `fs_watch_t` — on Linux straight into
-the `getdents64` buffer — valid until the next read. A file manager copies
-the names it keeps into its own model anyway.
+- Results that are strings (`fs_read_link`, `fs_real_path`, `fs_cwd`,
+  `fs_location`, `fs_from_native`, `fs_read_all`) **append to a `strbuf_t`**
+  the caller owns, as in `path`; on failure it is unchanged.
+- Results that are lists (`fs_dir_list`, `fs_volumes`) **append to a
+  `vec_t`** the caller owns, and their strings are **allocated from an
+  allocator the caller passes**: they live as long as it. filec never frees
+  what it hands out — pass an arena, reset it when the view goes.
+- What filec needs only while it works (an iterator's state, a watcher)
+  comes from the caller's allocator and goes back to it.
+- Streams hand out **views**, valid until the next step: names in
+  `fs_dir_iter` and in watch events. That keeps a long stream in constant
+  memory; copy what you keep.
 
 ### `want` / `valid` metadata masks
 
@@ -153,25 +159,33 @@ free plus what was asked for, and sets **valid** accordingly. Callers must
 check `valid`, never assume. A file manager can then paint names immediately
 and fetch sizes lazily on Linux, while Windows gets everything in one pass.
 
-### Batch API first, iterator on top
+### Listing: the whole of it, or a stream (decided)
 
-`fs_dir_read` fills a caller array — the fast, explicit primitive with an
-error per call. `fs_dir_iter` wraps it as a seqc `iter_t` for convenience.
+Two calls, because there are two lifetimes:
 
-`iter_t` has no error channel, so the iterator writes errors into a
-caller-provided `fs_err_t` and stops (the "side channel" approach):
+- `fs_dir_list(path, want, a, vec)` — the whole listing, the names in `a`:
+  what a file manager's directory view keeps, sorts and shows.
+- `fs_dir_iter(path, want, a, &err)` — a seqc `iter_t` in constant memory,
+  names valid until the next step: for walking, counting, searching.
+
+Both are written once (`fs_common.c`) on top of an internal per-backend
+`filec_dir_open` / `_next` / `_close` that hands out one entry at a time;
+the OS batches underneath anyway (`readdir` over `getdents64`,
+`FIND_FIRST_EX_LARGE_FETCH`), so a public batch API would save no system
+call.
+
+`iter_t` has no error channel (a terminal consumes the iterator, so there
+is nothing left to ask), so `fs_dir_iter` follows seqc's convention for
+sources that can fail: the error goes to a caller-provided `fs_err_t`, and
+a directory that cannot be opened gives a failed iterator — which since
+seqc 3.3 is safe with every adaptor and terminal:
 
 ```c
-fs_err_t err = {0};
-iter_t it = fs_dir_iter(path, FS_F_SIZE, alloc, &err);
-vec_extend(v, iter_filter(it, is_big, NULL));
-if (err.kind != FS_OK) { /* the loop stopped early */ }
+fs_err_t err;
+size_t n = iter_count(iter_filter(fs_dir_iter(path, FS_F_KIND, a, &err),
+                                  is_dir, NULL));
+if (!fs_ok(err)) { /* the listing stopped early */ }
 ```
-
-If the pattern shows up in many places, extend seqc with a fallible iterator
-(a `failed()` slot like `peek`, propagated by adaptors, reported by
-terminals). We own seqc, so that is an option — but start with the side
-channel, which costs nothing.
 
 ### Timestamps: `mtime` and `btime`, never `ctime`
 
@@ -204,9 +218,15 @@ delete. Without `FS_REPLACE` the "does the target exist" check is atomic
 ### Trash
 
 Linux follows the XDG trash spec: `$XDG_DATA_HOME/Trash` for the home volume,
-`$topdir/.Trash-$uid` (or `.Trash/$uid`) on other volumes, with a
-`.trashinfo` file per item. Windows uses the Recycle Bin. This is a sizeable
-piece of work on Linux — schedule it after the basics.
+`$topdir/.Trash/$uid` or `$topdir/.Trash-$uid` on other volumes, with a
+`.trashinfo` file per item so any file manager can restore it. macOS uses
+`~/.Trash` (or `$topdir/.Trashes/$uid`), Windows the Recycle Bin.
+
+It never copies across volumes, and where there is no trash it says
+`FS_ERR_UNSUPPORTED` and deletes **nothing**. That matters on Windows, where
+`SHFileOperationW` with `FOF_ALLOWUNDO` silently deletes for good on a drive
+without a Recycle Bin (network, removable): only fixed drives are let
+through.
 
 ### Watching
 
@@ -217,6 +237,10 @@ piece of work on Linux — schedule it after the basics.
 - `fs_watch_wait` blocks (meant for its own thread); `fs_watch_wake` unblocks
   it from any thread for shutdown. `add`/`remove` are safe from any thread
   while another thread waits.
+- What each system says differs: inotify and `ReadDirectoryChangesW` give
+  every kind with the entry's name; macOS kqueue only that a directory's
+  entries changed (name `""`: re-read it), and not a file rewritten in
+  place. FSEvents would do better on macOS — a later improvement.
 
 ### Recursive operations — deferred
 
