@@ -4,15 +4,19 @@
 #define _XOPEN_SOURCE 700
 #define _DARWIN_C_SOURCE /* macOS: st_mtimespec, st_birthtimespec */
 #define _DEFAULT_SOURCE
+#define _GNU_SOURCE
 
 #include "filec/fs.h"
+#include "filec/native.h"
 #include "filec/path.h"
-#include <stdint.h>
 
 #include "../fs_internal.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -596,5 +600,418 @@ void filec_dir_close(filec_dir_t *d)
     {
         closedir(d->dir);
         mem_free(d->a, d, sizeof *d);
+    }
+}
+
+/* --- Renaming, copying, links (step 4, tests/fs_ops_test.c) ------------ */
+
+static const fs_err_t posix_ok = {FS_OK, 0};
+
+/* rename that fails with EEXIST if to exists, atomically where the OS can
+ * (Linux renameat2, macOS renameatx_np).  Where it cannot — a kernel or a
+ * filesystem without the flag (EINVAL / ENOSYS / ENOTSUP: older NFS, some
+ * FUSE) — it falls back to check-then-rename, which only a racing creator
+ * can beat. */
+static int rename_noreplace(const char *from, const char *to)
+{
+#if defined(__APPLE__)
+    if (renameatx_np(AT_FDCWD, from, AT_FDCWD, to, RENAME_EXCL) == 0)
+    {
+        return 0;
+    }
+#elif defined(__linux__)
+    if (renameat2(AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE) == 0)
+    {
+        return 0;
+    }
+#else
+    errno = ENOSYS;
+#endif
+    if (errno != EINVAL && errno != ENOSYS && errno != ENOTSUP)
+    {
+        return -1;
+    }
+    struct stat st;
+    if (lstat(to, &st) == 0)
+    {
+        errno = EEXIST;
+        return -1;
+    }
+    return rename(from, to);
+}
+
+/* to is inside from: "d" -> "d/sub/d".  Canonical paths make it a prefix
+ * test. */
+static bool is_inside(string_t to, string_t from)
+{
+    return to.len > from.len && to.ptr[from.len] == '/'
+           && path_starts_with(to, from, PATH_CASE_NATIVE);
+}
+
+fs_err_t fs_rename(string_t from, string_t to, uint32_t flags)
+{
+    char from_buf[FILEC_PATH_BUF_MAX];
+    char to_buf[FILEC_PATH_BUF_MAX];
+    fs_err_t err = filec_path_cstr(from, from_buf, sizeof from_buf);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    err = filec_path_cstr(to, to_buf, sizeof to_buf);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    if (is_inside(to, from))
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+
+    struct stat from_st;
+    if (lstat(from_buf, &from_st) != 0)
+    {
+        return filec_from_errno(errno);
+    }
+    struct stat to_st;
+    bool to_exists = lstat(to_buf, &to_st) == 0;
+    if (!to_exists && errno != ENOENT)
+    {
+        return filec_from_errno(errno); /* e.g. a file on the way */
+    }
+
+    if (to_exists && from_st.st_dev == to_st.st_dev
+        && from_st.st_ino == to_st.st_ino)
+    {
+        if (strcmp(from_buf, to_buf) == 0)
+        {
+            return posix_ok; /* to itself: nothing to do */
+        }
+        /* The same entry under another case (a case-insensitive volume):
+         * rename changes the case.  Otherwise these are two hard links to
+         * one file, and to is in the way like any other file. */
+        if (path_equals(from, to, PATH_CASE_INSENSITIVE))
+        {
+            return rename(from_buf, to_buf) == 0 ? posix_ok
+                                                 : filec_from_errno(errno);
+        }
+    }
+
+    if (to_exists)
+    {
+        if (S_ISDIR(to_st.st_mode))
+        {
+            return (fs_err_t){
+                (flags & FS_REPLACE) ? FS_ERR_IS_DIR : FS_ERR_EXISTS, 0};
+        }
+        if (!(flags & FS_REPLACE))
+        {
+            return (fs_err_t){FS_ERR_EXISTS, 0};
+        }
+    }
+
+    int r = (flags & FS_REPLACE) ? rename(from_buf, to_buf)
+                                 : rename_noreplace(from_buf, to_buf);
+    if (r != 0)
+    {
+        return errno == EINVAL ? (fs_err_t){FS_ERR_INVALID, EINVAL}
+                               : filec_from_errno(errno);
+    }
+    return posix_ok;
+}
+
+/* At most this much between two looks at cancel and two progress calls. */
+#define COPY_CHUNK ((size_t)1 << 20)
+
+/* The read/write fallback's buffer, on the stack. */
+#define COPY_BUF (64 * 1024)
+
+/* Up to COPY_CHUNK bytes from in to out at their current positions:
+ * copy_file_range on Linux (in the kernel, reflinks where the filesystem
+ * can), read/write of up to COPY_BUF otherwise or where it is refused
+ * (another filesystem, an old kernel).  *got: what was copied, 0 at the
+ * end of in. */
+static fs_err_t copy_chunk(int in, int out, char buf[COPY_BUF], size_t *got)
+{
+#if defined(__linux__)
+    static bool no_cfr; /* once refused, never asked again */
+    if (!no_cfr)
+    {
+        for (;;)
+        {
+            ssize_t r = copy_file_range(in, NULL, out, NULL, COPY_CHUNK, 0);
+            if (r >= 0)
+            {
+                *got = (size_t)r;
+                return posix_ok;
+            }
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            if (errno != EXDEV && errno != ENOSYS && errno != EINVAL
+                && errno != EOPNOTSUPP)
+            {
+                return filec_from_errno(errno);
+            }
+            no_cfr = true; /* nothing was copied: read/write instead */
+            break;
+        }
+    }
+#endif
+    ssize_t r;
+    do
+    {
+        r = read(in, buf, COPY_BUF);
+    } while (r < 0 && errno == EINTR);
+    if (r < 0)
+    {
+        return filec_from_errno(errno);
+    }
+    for (size_t done = 0; done < (size_t)r;)
+    {
+        ssize_t w = write(out, buf + done, (size_t)r - done);
+        if (w < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            return filec_from_errno(errno);
+        }
+        done += (size_t)w;
+    }
+    *got = (size_t)r;
+    return posix_ok;
+}
+
+static bool cancelled(const fs_op_t *op)
+{
+    return op && op->cancel && atomic_load(op->cancel);
+}
+
+fs_err_t fs_copy_file(
+    string_t from, string_t to, uint32_t flags, const fs_op_t *op)
+{
+    char from_buf[FILEC_PATH_BUF_MAX];
+    char to_buf[FILEC_PATH_BUF_MAX];
+    fs_err_t err = filec_path_cstr(from, from_buf, sizeof from_buf);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    err = filec_path_cstr(to, to_buf, sizeof to_buf);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+
+    int in = open(from_buf, O_RDONLY | O_CLOEXEC); /* follows a link */
+    if (in < 0)
+    {
+        return filec_from_errno(errno);
+    }
+    struct stat from_st;
+    if (fstat(in, &from_st) != 0)
+    {
+        err = filec_from_errno(errno);
+        close(in);
+        return err;
+    }
+    if (S_ISDIR(from_st.st_mode))
+    {
+        close(in);
+        return (fs_err_t){FS_ERR_IS_DIR, 0};
+    }
+
+    /* What is at to: the same file (copying would empty it), a directory
+     * (also through a link), or anything at all without FS_REPLACE. */
+    struct stat to_st;
+    if (lstat(to_buf, &to_st) == 0)
+    {
+        struct stat target; /* to followed, if it is a link */
+        bool followed = stat(to_buf, &target) == 0;
+        if (followed && target.st_dev == from_st.st_dev
+            && target.st_ino == from_st.st_ino)
+        {
+            err = (fs_err_t){FS_ERR_INVALID, 0};
+        }
+        else if (
+            S_ISDIR(to_st.st_mode) || (followed && S_ISDIR(target.st_mode)))
+        {
+            err = (fs_err_t){FS_ERR_IS_DIR, 0};
+        }
+        else if (!(flags & FS_REPLACE))
+        {
+            err = (fs_err_t){FS_ERR_EXISTS, 0};
+        }
+    }
+    else if (errno != ENOENT)
+    {
+        err = filec_from_errno(errno);
+    }
+    if (!fs_ok(err))
+    {
+        close(in);
+        return err;
+    }
+
+    /* The copy is written beside to and renamed into place at the end, so
+     * an old file at to survives a cancel or an error. */
+    char tmp_buf[FILEC_PATH_BUF_MAX + 32];
+    long pid = (long)getpid();
+    int out = -1;
+    for (int i = 1; out < 0; i++)
+    {
+        if (i == 1000)
+        {
+            close(in);
+            return (fs_err_t){FS_ERR_IO, 0};
+        }
+        snprintf(tmp_buf, sizeof tmp_buf, "%s.tmp%ld.%03d", to_buf, pid, i);
+        out = open(tmp_buf, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+        if (out < 0 && errno != EEXIST)
+        {
+            err = filec_from_errno(errno);
+            close(in);
+            return err;
+        }
+    }
+
+    char buf[COPY_BUF];
+    uint64_t total = (uint64_t)from_st.st_size;
+    uint64_t done = 0;
+    while (fs_ok(err))
+    {
+        if (cancelled(op))
+        {
+            err = (fs_err_t){FS_ERR_CANCELLED, 0};
+            break;
+        }
+        size_t got = 0;
+        err = copy_chunk(in, out, buf, &got);
+        if (!fs_ok(err) || got == 0)
+        {
+            break;
+        }
+        done += got;
+        if (op && op->progress)
+        {
+            op->progress(op->user, done, total > done ? total : done);
+        }
+    }
+    if (fs_ok(err) && done == 0 && op && op->progress)
+    {
+        op->progress(op->user, 0, 0); /* an empty file: done == total */
+    }
+
+    if (fs_ok(err) && (flags & FS_KEEP_METADATA))
+    {
+#ifdef __APPLE__
+        struct timespec times[2] = {from_st.st_atimespec, from_st.st_mtimespec};
+#else
+        struct timespec times[2] = {from_st.st_atim, from_st.st_mtim};
+#endif
+        if (futimens(out, times) != 0
+            || fchmod(out, from_st.st_mode & 07777) != 0)
+        {
+            err = filec_from_errno(errno);
+        }
+    }
+    /* Replacing a file: its content must be on disk before the rename
+     * puts it in place (as in fs_write_atomic). */
+    if (fs_ok(err) && (flags & FS_REPLACE) && fsync(out) != 0)
+    {
+        err = filec_from_errno(errno);
+    }
+    if (close(out) != 0 && fs_ok(err))
+    {
+        err = filec_from_errno(errno);
+    }
+    close(in);
+
+    if (fs_ok(err))
+    {
+        int r = (flags & FS_REPLACE) ? rename(tmp_buf, to_buf)
+                                     : rename_noreplace(tmp_buf, to_buf);
+        if (r != 0)
+        {
+            err = filec_from_errno(errno);
+        }
+    }
+    if (!fs_ok(err))
+    {
+        unlink(tmp_buf);
+    }
+    return err;
+}
+
+fs_err_t fs_read_link(string_t path, strbuf_t *out)
+{
+    if (!out)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    char buf[FILEC_PATH_BUF_MAX];
+    fs_err_t err = filec_path_cstr(path, buf, sizeof buf);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    char target[FILEC_PATH_BUF_MAX];
+    ssize_t n = readlink(buf, target, sizeof target);
+    if (n < 0)
+    {
+        return errno == EINVAL ? (fs_err_t){FS_ERR_INVALID, EINVAL}
+                               /* no link */
+                               : filec_from_errno(errno);
+    }
+    if ((size_t)n == sizeof target)
+    {
+        return (fs_err_t){FS_ERR_NAME_TOO_LONG, 0};
+    }
+    string_t t = {target, (size_t)n};
+
+    /* As stored; an absolute target is normalised to canonical form. */
+    if (n > 0 && target[0] == '/')
+    {
+        switch (path_from_native(t, PATH_STYLE_POSIX, out))
+        {
+        case PATH_NATIVE_OK:
+            return posix_ok;
+        case PATH_NATIVE_OOM:
+            return (fs_err_t){FS_ERR_OOM, 0};
+        default:
+            return (fs_err_t){FS_ERR_INVALID, 0};
+        }
+    }
+    return strbuf_append(out, t) == SEQC_OK ? posix_ok
+                                            : (fs_err_t){FS_ERR_OOM, 0};
+}
+
+fs_err_t fs_real_path(string_t path, strbuf_t *out)
+{
+    if (!out)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    char buf[FILEC_PATH_BUF_MAX];
+    fs_err_t err = filec_path_cstr(path, buf, sizeof buf);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    char resolved[PATH_MAX];
+    if (!realpath(buf, resolved))
+    {
+        return filec_from_errno(errno);
+    }
+    switch (path_from_native(string_view_cstr(resolved), PATH_STYLE_POSIX, out))
+    {
+    case PATH_NATIVE_OK:
+        return posix_ok;
+    case PATH_NATIVE_OOM:
+        return (fs_err_t){FS_ERR_OOM, 0};
+    default:
+        return (fs_err_t){FS_ERR_INVALID, 0};
     }
 }

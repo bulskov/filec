@@ -4,7 +4,8 @@
  * STATUS: being implemented step by step — see README.md.  Step 1 (errors,
  * mkdir, remove, stat, exists): tests/fs_basic_test.c.  Step 2 (files):
  * tests/fs_file_test.c.  Step 3 (reading directories):
- * tests/fs_dir_test.c.
+ * tests/fs_dir_test.c.  Step 4 (mkdir_all, rename, copy_file, read_link,
+ * real_path): tests/fs_ops_test.c.
  *
  * Paths:     every path in and out is CANONICAL, normalised and ABSOLUTE
  *            (see filec/path.h): "/C:/Users/me", not "C:\Users\me".  A
@@ -197,9 +198,18 @@ fs_stat(string_t path, uint32_t want, uint32_t flags, fs_entry_t *out);
  * not exist.  Any error counts as false. */
 bool fs_exists(string_t path);
 
-/* The target of a link, as stored (may be relative), appended to out. */
+/* The target of the link at path, appended to out, as stored but with
+ * '/' as the separator: a relative target stays relative ("../x"), an
+ * absolute one comes back canonical ("/C:/x" on Windows).  A dangling link
+ * works too.  Not a link: FS_ERR_INVALID; missing: FS_ERR_NOT_FOUND.  On
+ * failure out is unchanged. */
 FS_NODISCARD fs_err_t fs_read_link(string_t path, strbuf_t *out);
-/* path with every link resolved, appended to out. */
+
+/* path with every link resolved, appended to out: canonical and absolute,
+ * the path the file is really at (also the long form of a Windows 8.3
+ * name).  Missing, or a dangling link: FS_ERR_NOT_FOUND; links in a
+ * circle: FS_ERR_LOOP; a file on the way: FS_ERR_NOT_DIR.  On failure out
+ * is unchanged. */
 FS_NODISCARD fs_err_t fs_real_path(string_t path, strbuf_t *out);
 
 /* --- Files --------------------------------------------------------------- */
@@ -290,18 +300,47 @@ enum
  * (whatever it is), FS_ERR_NOT_FOUND if the parent is missing,
  * FS_ERR_NOT_DIR if the parent is a file. */
 FS_NODISCARD fs_err_t fs_mkdir(string_t path);
-FS_NODISCARD fs_err_t fs_mkdir_all(string_t path); /* like mkdir -p */
+/* path and every missing directory above it, like mkdir -p.  A directory
+ * that is already there is fine — also one another thread or process
+ * creates at the same moment.  A file at path: FS_ERR_EXISTS; a file on
+ * the way: FS_ERR_NOT_DIR.  On failure the directories made so far stay. */
+FS_NODISCARD fs_err_t fs_mkdir_all(string_t path);
 /* A file, a link (not its target) or an EMPTY directory.
  * FS_ERR_NOT_EMPTY for a directory with anything in it. */
 FS_NODISCARD fs_err_t fs_remove(string_t path);
 
-/* Atomic, same volume only (FS_ERR_CROSS_DEVICE otherwise).  Without
- * FS_REPLACE the existence check is atomic too: renameat2(RENAME_NOREPLACE)
- * / MoveFileExW without MOVEFILE_REPLACE_EXISTING. */
+/* Moves a file, link (not its target) or directory (with everything in
+ * it) to a new name.  Atomic, same volume only (FS_ERR_CROSS_DEVICE
+ * otherwise: copy + delete instead).
+ *
+ * Something at to: FS_ERR_EXISTS, both untouched — the check is atomic
+ * (renameat2(RENAME_NOREPLACE) / MoveFileExW without REPLACE_EXISTING).
+ * With FS_REPLACE a file or link at to is replaced; a DIRECTORY at to is
+ * never replaced (FS_ERR_IS_DIR, also an empty one — remove it first).
+ *
+ * to naming the same file as from is fine: from == to does nothing, and a
+ * change of case only ("a" -> "A") renames on a case-insensitive volume
+ * (Windows, macOS) without FS_REPLACE.  A directory into itself
+ * ("d" -> "d/sub/d"): FS_ERR_INVALID.  A file open elsewhere can be
+ * renamed (fs_open shares delete access on Windows). */
 FS_NODISCARD fs_err_t fs_rename(string_t from, string_t to, uint32_t flags);
 
-/* One file.  copy_file_range / CopyFileExW; op may be NULL.
- * On cancel or error the partial target is removed. */
+/* One regular file's content to a new file (copy_file_range /
+ * CopyFileExW).  from is followed if it is a link: the copy is a file.
+ *
+ * Something at to: FS_ERR_EXISTS, untouched.  With FS_REPLACE an existing
+ * file at to stays as it was until the copy is complete (it is written
+ * beside it and renamed over it), so a cancelled or failed copy never
+ * costs the old file.  A directory at from or at to: FS_ERR_IS_DIR.  from
+ * and to the same file (also through a link): FS_ERR_INVALID, untouched.
+ *
+ * On cancel (FS_ERR_CANCELLED) or error nothing new is left: no partial
+ * target, no temporary.  FS_KEEP_METADATA keeps the mtime (and on POSIX
+ * the permission bits); without it the copy is new.
+ *
+ * op may be NULL.  With op, progress(user, done, total) is called as the
+ * copy goes — done grows, total is the size, the last call has done ==
+ * total — and cancel is checked, at least every MiB. */
 FS_NODISCARD fs_err_t
 fs_copy_file(string_t from, string_t to, uint32_t flags, const fs_op_t *op);
 

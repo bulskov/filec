@@ -23,7 +23,12 @@
  *   fx_read_file(rel, &len)      the contents of a file (static buffer,
  *                                up to 64 KiB), NULL if it cannot be read
  *   fx_count_entries(rel)        entries in a directory, without . and ..;
- *                                -1 if it cannot be read */
+ *                                -1 if it cannot be read
+ *   fx_write_bytes(rel, p, n)    create a file with n bytes of binary data
+ *   fx_exists(rel), fx_is_dir    without following a link
+ *   fx_set_mtime(rel, secs)      the modification time, seconds since 1970
+ *   fx_mode(rel)                 POSIX permission bits; -1 on Windows
+ *   fx_is_wine()                 running under Wine, not Windows */
 
 #ifndef _WIN32
 #define _XOPEN_SOURCE 700
@@ -43,8 +48,10 @@
 #include <windows.h>
 #else
 #include <dirent.h>
+#include <fcntl.h> /* AT_FDCWD */
 #include <ftw.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -277,6 +284,59 @@ static inline FILE *fx_fopen(const char *native, const char *mode)
     return _wfsopen(fx_wide(native), fx_wide(mode), _SH_DENYNO);
 }
 
+/* Running under Wine (ntdll exports wine_get_version): for the few
+ * places where Wine does not behave like Windows. */
+static inline bool fx_is_wine(void)
+{
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll && GetProcAddress(ntdll, "wine_get_version");
+}
+
+static inline DWORD fx_attrs(const char *rel)
+{
+    return GetFileAttributesW(fx_wide(fx_native(FX(rel))));
+}
+
+static inline bool fx_exists(const char *rel)
+{
+    return fx_attrs(rel) != INVALID_FILE_ATTRIBUTES;
+}
+
+static inline bool fx_is_dir(const char *rel)
+{
+    DWORD a = fx_attrs(rel);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static inline bool fx_set_mtime(const char *rel, long long secs)
+{
+    HANDLE h = CreateFileW(
+        fx_wide(fx_native(FX(rel))),
+        FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        NULL);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+    /* 100 ns ticks since 1601 */
+    unsigned long long t =
+        (unsigned long long)secs * 10000000ULL + 116444736000000000ULL;
+    FILETIME ft = {(DWORD)t, (DWORD)(t >> 32)};
+    bool ok = SetFileTime(h, NULL, NULL, &ft);
+    CloseHandle(h);
+    return ok;
+}
+
+static inline int fx_mode(const char *rel)
+{
+    (void)rel;
+    return -1;
+}
+
 #else /* POSIX */
 
 static inline int fx_remove_one(
@@ -367,6 +427,35 @@ static inline FILE *fx_fopen(const char *native, const char *mode)
     return fopen(native, mode);
 }
 
+static inline bool fx_is_wine(void)
+{
+    return false;
+}
+
+static inline bool fx_exists(const char *rel)
+{
+    struct stat st;
+    return lstat(fx_native(FX(rel)), &st) == 0;
+}
+
+static inline bool fx_is_dir(const char *rel)
+{
+    struct stat st;
+    return lstat(fx_native(FX(rel)), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static inline bool fx_set_mtime(const char *rel, long long secs)
+{
+    struct timespec ts[2] = {{0, UTIME_OMIT}, {(time_t)secs, 0}};
+    return utimensat(AT_FDCWD, fx_native(FX(rel)), ts, 0) == 0;
+}
+
+static inline int fx_mode(const char *rel)
+{
+    struct stat st;
+    return stat(fx_native(FX(rel)), &st) == 0 ? (int)(st.st_mode & 07777) : -1;
+}
+
 #endif
 
 static inline bool fx_write_file(const char *rel, const char *text)
@@ -378,6 +467,17 @@ static inline bool fx_write_file(const char *rel, const char *text)
     }
     size_t n = strlen(text);
     bool ok = fwrite(text, 1, n, f) == n;
+    return fclose(f) == 0 && ok;
+}
+
+static inline bool fx_write_bytes(const char *rel, const void *p, size_t n)
+{
+    FILE *f = fx_fopen(fx_native(FX(rel)), "wb");
+    if (!f)
+    {
+        return false;
+    }
+    bool ok = fwrite(p, 1, n, f) == n;
     return fclose(f) == 0 && ok;
 }
 
