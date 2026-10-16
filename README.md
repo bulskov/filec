@@ -73,14 +73,26 @@ Fetched with CMake `FetchContent` using the dependency names `arena`, `seqc`,
 `ctt`, so a parent project's declarations win and diamond dependencies resolve
 to one copy.
 
-## Suggested order of work
+## Status
 
-1. `path` — pure logic, test-heavy. A good place to start.
-2. `native` — the Windows and POSIX conversion rules.
-3. `fs` reading: `fs_dir_*`, `fs_stat`, files.
-4. `fs` changing: mkdir, remove, rename, copy, trash.
-5. Watching, locations, volumes.
-6. Win32 backend for all of the above.
+All of `path`, `native` and `fs` works on Linux, macOS and Windows, tested
+in CI on all three (gcc, clang, AddressSanitizer + UBSan, clang-cl).
+
+| Area | Functions | Tests |
+|---|---|---|
+| Paths | `path_*` | `tests/path_test.c` |
+| Native forms | `path_from_native`, `path_to_native` | `tests/native_test.c` |
+| Errors, metadata | `fs_err_str`, `fs_mkdir`, `fs_remove`, `fs_stat`, `fs_exists` | `tests/fs_basic_test.c` |
+| Files | `fs_open`, `fs_read_at`, `fs_write_at`, `fs_read_all`, `fs_write_atomic`, ... | `tests/fs_file_test.c` |
+| Directories | `fs_dir_list`, `fs_dir_iter` | `tests/fs_dir_test.c` |
+| Operations | `fs_mkdir_all`, `fs_rename`, `fs_copy_file`, `fs_read_link`, `fs_real_path` | `tests/fs_ops_test.c` |
+| Places | `fs_cwd`, `fs_location`, `fs_from_native` | `tests/fs_places_test.c` |
+| Volumes | `fs_volumes`, `fs_space` | `tests/fs_volume_test.c` |
+| Watching | `fs_watch_*` | `tests/fs_watch_test.c` |
+| Trash | `fs_trash` | `tests/fs_trash_test.c` |
+
+Left out on purpose for now: recursive copy / delete / walk (see
+[docs/interface.md](docs/interface.md)).
 
 ## Build
 

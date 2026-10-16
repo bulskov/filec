@@ -1992,3 +1992,324 @@ void fs_watch_destroy(fs_watch_t *w)
 }
 
 #endif
+
+/* --- Trash (step 8, tests/fs_trash_test.c) ------------------------------- */
+
+/* snprintf's result r into buf fitted (no truncation). */
+#define FITS_N(r, n) ((r) >= 0 && (size_t)(r) < (n))
+#define FITS(r, buf) FITS_N(r, sizeof(buf))
+
+/* mkdir -p for a native path, the last level with mode. */
+static bool make_dirs(const char *path, mode_t mode)
+{
+    char buf[FILEC_PATH_BUF_MAX * 2];
+    size_t n = (size_t)snprintf(buf, sizeof buf, "%s", path);
+    if (n >= sizeof buf)
+    {
+        return false;
+    }
+    for (size_t i = 1; i <= n; i++)
+    {
+        if (buf[i] == '/' || buf[i] == '\0')
+        {
+            char c = buf[i];
+            buf[i] = '\0';
+            if (mkdir(buf, i == n ? mode : 0777) != 0 && errno != EEXIST)
+            {
+                return false;
+            }
+            buf[i] = c;
+        }
+    }
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* The directory where the volume of dev starts, walking up from dir. */
+static bool volume_top(const char *dir, dev_t dev, char *top, size_t size)
+{
+    char cur[PATH_MAX];
+    if (!realpath(dir, cur))
+    {
+        return false;
+    }
+    for (;;)
+    {
+        char *slash = strrchr(cur, '/');
+        if (!slash || slash == cur)
+        {
+            struct stat st;
+            if (stat("/", &st) == 0 && st.st_dev == dev)
+            {
+                snprintf(top, size, "/");
+                return true;
+            }
+            snprintf(top, size, "%s", cur);
+            return true;
+        }
+        *slash = '\0';
+        struct stat st;
+        if (stat(cur, &st) != 0 || st.st_dev != dev)
+        {
+            *slash = '/';
+            snprintf(top, size, "%s", cur);
+            return true;
+        }
+    }
+}
+
+/* The trash for something on device dev in directory parent: the home
+ * trash if it is on that device, else one at the top of its volume.
+ * files and info are set (info is "" on macOS, which keeps none);
+ * *topdir is set for a top-of-volume trash (its .trashinfo paths are
+ * relative to it), "" for the home trash. */
+static fs_err_t find_trash(
+    const char *parent,
+    dev_t dev,
+    char files[FILEC_PATH_BUF_MAX],
+    char info[FILEC_PATH_BUF_MAX],
+    char topdir[FILEC_PATH_BUF_MAX])
+{
+    char home[FILEC_PATH_BUF_MAX];
+    fs_err_t err = home_dir(home, sizeof home);
+    char base[FILEC_PATH_BUF_MAX];
+    topdir[0] = '\0';
+    info[0] = '\0';
+    struct stat st;
+#ifdef __APPLE__
+    if (fs_ok(err))
+    {
+        snprintf(files, FILEC_PATH_BUF_MAX, "%s/.Trash", home);
+        if (make_dirs(files, 0700) && stat(files, &st) == 0 && st.st_dev == dev)
+        {
+            return posix_ok;
+        }
+    }
+    if (!volume_top(parent, dev, topdir, FILEC_PATH_BUF_MAX))
+    {
+        return (fs_err_t){FS_ERR_UNSUPPORTED, 0};
+    }
+    snprintf(
+        files,
+        FILEC_PATH_BUF_MAX,
+        "%s/.Trashes/%ld",
+        strcmp(topdir, "/") ? topdir : "",
+        (long)getuid());
+    topdir[0] = '\0';
+    return make_dirs(files, 0700) ? posix_ok
+                                  : (fs_err_t){FS_ERR_UNSUPPORTED, 0};
+#else
+    /* the home trash: $XDG_DATA_HOME/Trash */
+    const char *xdg = absolute_env("XDG_DATA_HOME");
+    if (xdg || fs_ok(err))
+    {
+        bool fits =
+            (xdg ? FITS(snprintf(base, sizeof base, "%s/Trash", xdg), base)
+                 : FITS(
+                       snprintf(
+                           base, sizeof base, "%s/.local/share/Trash", home),
+                       base))
+            && FITS_N(
+                snprintf(files, FILEC_PATH_BUF_MAX, "%s/files", base),
+                FILEC_PATH_BUF_MAX)
+            && FITS_N(
+                snprintf(info, FILEC_PATH_BUF_MAX, "%s/info", base),
+                FILEC_PATH_BUF_MAX);
+        if (fits && make_dirs(base, 0700) && make_dirs(files, 0700)
+            && make_dirs(info, 0700) && stat(base, &st) == 0
+            && st.st_dev == dev)
+        {
+            return posix_ok;
+        }
+    }
+
+    /* a trash at the top of the volume: $topdir/.Trash/$uid (made by an
+     * administrator: a real directory with the sticky bit), else
+     * $topdir/.Trash-$uid */
+    if (!volume_top(parent, dev, topdir, FILEC_PATH_BUF_MAX))
+    {
+        return (fs_err_t){FS_ERR_UNSUPPORTED, 0};
+    }
+    const char *t = strcmp(topdir, "/") ? topdir : "";
+    long uid = (long)getuid();
+    char shared[FILEC_PATH_BUF_MAX];
+    snprintf(shared, sizeof shared, "%s/.Trash", t);
+    if (lstat(shared, &st) == 0 && S_ISDIR(st.st_mode)
+        && (st.st_mode & S_ISVTX))
+    {
+        snprintf(base, sizeof base, "%s/.Trash/%ld", t, uid);
+    }
+    else
+    {
+        snprintf(base, sizeof base, "%s/.Trash-%ld", t, uid);
+    }
+    bool fits = FITS_N(
+                    snprintf(files, FILEC_PATH_BUF_MAX, "%s/files", base),
+                    FILEC_PATH_BUF_MAX)
+                && FITS_N(
+                    snprintf(info, FILEC_PATH_BUF_MAX, "%s/info", base),
+                    FILEC_PATH_BUF_MAX);
+    if (fits && make_dirs(base, 0700) && make_dirs(files, 0700)
+        && make_dirs(info, 0700) && stat(base, &st) == 0 && st.st_dev == dev)
+    {
+        return posix_ok;
+    }
+    return (fs_err_t){FS_ERR_UNSUPPORTED, 0}; /* never copy across */
+#endif
+}
+
+/* path percent-encoded for a .trashinfo (RFC 2396: '/' and the
+ * unreserved characters stay). */
+static bool url_encode(const char *path, char *out, size_t size)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)path; *p; p++)
+    {
+        bool keep = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')
+                    || (*p >= '0' && *p <= '9') || strchr("/-_.~", *p);
+        if (n + 4 > size)
+        {
+            return false;
+        }
+        if (keep)
+        {
+            out[n++] = (char)*p;
+        }
+        else
+        {
+            out[n++] = '%';
+            out[n++] = hex[*p >> 4];
+            out[n++] = hex[*p & 15];
+        }
+    }
+    out[n] = '\0';
+    return true;
+}
+
+fs_err_t fs_trash(string_t path)
+{
+    char buf[FILEC_PATH_BUF_MAX];
+    fs_err_t err = filec_path_cstr(path, buf, sizeof buf);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    struct stat st;
+    if (lstat(buf, &st) != 0)
+    {
+        return filec_from_errno(errno);
+    }
+    string_t name = path_file_name(path);
+    if (name.len == 0)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0}; /* "/" */
+    }
+    char parent[FILEC_PATH_BUF_MAX];
+    snprintf(parent, sizeof parent, "%.*s", (int)(path.len - name.len), buf);
+
+    char files[FILEC_PATH_BUF_MAX], info[FILEC_PATH_BUF_MAX];
+    char topdir[FILEC_PATH_BUF_MAX];
+    err = find_trash(parent, st.st_dev, files, info, topdir);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+
+    /* A free name: name, name.2, name.3, ... — claimed by creating its
+     * .trashinfo with O_EXCL (on macOS: by the rename itself). */
+    char dest[2 * FILEC_PATH_BUF_MAX + 32];
+    char info_path[2 * FILEC_PATH_BUF_MAX + 64];
+    for (int i = 1;; i++)
+    {
+        if (i == 10000)
+        {
+            return (fs_err_t){FS_ERR_EXISTS, 0};
+        }
+        char suffix[16] = "";
+        if (i > 1)
+        {
+#ifdef __APPLE__
+            snprintf(suffix, sizeof suffix, " %d", i);
+#else
+            snprintf(suffix, sizeof suffix, ".%d", i);
+#endif
+        }
+        snprintf(
+            dest,
+            sizeof dest,
+            "%s/%.*s%s",
+            files,
+            (int)name.len,
+            name.ptr,
+            suffix);
+        struct stat there;
+        if (lstat(dest, &there) == 0)
+        {
+            continue;
+        }
+        if (info[0] == '\0')
+        {
+            break;
+        }
+        snprintf(
+            info_path,
+            sizeof info_path,
+            "%s/%.*s%s.trashinfo",
+            info,
+            (int)name.len,
+            name.ptr,
+            suffix);
+        int fd = open(info_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd < 0 && errno == EEXIST)
+        {
+            continue;
+        }
+        if (fd < 0)
+        {
+            return filec_from_errno(errno);
+        }
+        /* where it was (relative to the top of its volume for a trash
+         * there), and when */
+        const char *where = buf;
+        size_t tl = strlen(topdir);
+        if (tl > 0)
+        {
+            where = buf + tl + (strcmp(topdir, "/") ? 1 : 0);
+        }
+        char encoded[3 * FILEC_PATH_BUF_MAX + 1];
+        char date[32];
+        time_t now = time(NULL);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        strftime(date, sizeof date, "%Y-%m-%dT%H:%M:%S", &tm);
+        char text[4 * FILEC_PATH_BUF_MAX];
+        int len = url_encode(where, encoded, sizeof encoded)
+                      ? snprintf(
+                            text,
+                            sizeof text,
+                            "[Trash Info]\nPath=%s\nDeletionDate=%s\n",
+                            encoded,
+                            date)
+                      : -1;
+        bool written = len > 0 && write(fd, text, (size_t)len) == len;
+        close(fd);
+        if (!written)
+        {
+            unlink(info_path);
+            return (fs_err_t){FS_ERR_IO, 0};
+        }
+        break;
+    }
+
+    if (rename(buf, dest) != 0)
+    {
+        err = filec_from_errno(errno);
+        if (info[0])
+        {
+            unlink(info_path);
+        }
+        return err;
+    }
+    return posix_ok;
+}

@@ -2067,3 +2067,69 @@ void fs_watch_destroy(fs_watch_t *w)
     CloseHandle(w->port);
     mem_free(w->a, w, sizeof *w);
 }
+
+/* --- Trash (step 8, tests/fs_trash_test.c) ---------------------------------
+ *
+ * SHFileOperationW with FOF_ALLOWUNDO puts it in the Recycle Bin.  But
+ * where a drive has no Recycle Bin (network, removable) the same call
+ * DELETES for good, without asking — so only fixed drives are let
+ * through, and everything else is FS_ERR_UNSUPPORTED.  SHFileOperationW
+ * knows no "\\?\" paths: MAX_PATH is its limit. */
+
+#include <shellapi.h>
+
+fs_err_t fs_trash(string_t path)
+{
+    wchar_t w[WPATH_MAX];
+    fs_err_t err = to_wide(path, w);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    if (GetFileAttributesW(w) == INVALID_FILE_ATTRIBUTES)
+    {
+        return not_dir_on_the_way(path, last_err());
+    }
+
+    /* the plain Win32 path: "\\?\C:\x" -> "C:\x", "\\?\UNC\s\h" ->
+     * "\\s\h" (a share: no Recycle Bin, refused below anyway) */
+    const wchar_t *plain = w + 4;
+    if (wcsncmp(w, L"\\\\?\\UNC\\", 8) == 0)
+    {
+        return (fs_err_t){FS_ERR_UNSUPPORTED, 0};
+    }
+    wchar_t root[4] = {plain[0], L':', L'\\', L'\0'};
+    if (GetDriveTypeW(root) != DRIVE_FIXED)
+    {
+        return (fs_err_t){FS_ERR_UNSUPPORTED, 0}; /* would delete for good */
+    }
+    size_t n = wcslen(plain);
+    if (n >= MAX_PATH)
+    {
+        return (fs_err_t){FS_ERR_NAME_TOO_LONG, 0};
+    }
+    wchar_t from[MAX_PATH + 1]; /* double-NUL-terminated list of one */
+    wmemcpy(from, plain, n);
+    from[n] = L'\0';
+    from[n + 1] = L'\0';
+
+    SHFILEOPSTRUCTW op;
+    memset(&op, 0, sizeof op);
+    op.wFunc = FO_DELETE;
+    op.pFrom = from;
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+                | FOF_NOCONFIRMMKDIR;
+    int r = SHFileOperationW(&op);
+    if (op.fAnyOperationsAborted)
+    {
+        return (fs_err_t){FS_ERR_CANCELLED, 0};
+    }
+    if (r != 0)
+    {
+        /* SHFileOperationW's own codes; most are Win32 codes too */
+        return r == 0x7C /* DE_INVALIDFILES */
+                   ? (fs_err_t){FS_ERR_NOT_FOUND, r}
+                   : win_err((DWORD)r);
+    }
+    return ok;
+}
