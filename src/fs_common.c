@@ -130,3 +130,128 @@ fs_err_t fs_read_all(string_t path, strbuf_t *out)
     fs_close(f);
     return (fs_err_t){FS_OK, 0};
 }
+
+fs_err_t fs_dir_list(string_t path, uint32_t want, allocator_t a, vec_t *out)
+{
+    if (!out || vec_elem_size(out) != sizeof(fs_entry_t))
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+
+    filec_dir_t *dir;
+    fs_err_t err = filec_dir_open(path, want, a, &dir);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+
+    bool done = false;
+    size_t mark = vec_len(out);
+    for (;;)
+    {
+        fs_entry_t e;
+        err = filec_dir_next(dir, &e, &done);
+        if (!fs_ok(err) || done)
+        {
+            break;
+        }
+        char *name = mem_alloc(a, e.name.len ? e.name.len : 1, 1);
+        if (!name)
+        {
+            err = (fs_err_t){FS_ERR_OOM, 0};
+            break;
+        }
+        memcpy(name, e.name.ptr, e.name.len);
+        e.name = (string_t){name, e.name.len};
+        if (vec_push(out, &e) != SEQC_OK)
+        {
+            err = (fs_err_t){FS_ERR_OOM, 0};
+            break;
+        }
+    }
+    filec_dir_close(dir);
+    if (!fs_ok(err))
+    {
+        vec_truncate(out, mark);
+    }
+    return err;
+}
+
+struct fs_dir_iter_state
+{
+    filec_dir_t *dir;
+    fs_err_t *err;
+    bool done;
+};
+
+static bool fs_dir_iter_next(iter_t *iter, void *out)
+{
+    struct fs_dir_iter_state *state = iter->state;
+    if (state->done)
+    {
+        return false;
+    }
+
+    fs_entry_t *entry = out;
+
+    fs_err_t next_err = filec_dir_next(state->dir, entry, &state->done);
+    if (!fs_ok(next_err) || state->done)
+    {
+        if (state->err)
+        {
+            *state->err = next_err;
+        }
+        state->done = true;
+        return false;
+    }
+    return true;
+}
+
+static void fs_dir_iter_destroy(iter_t *it)
+{
+    struct fs_dir_iter_state *state = it->state;
+    filec_dir_close(state->dir);
+    mem_free(it->allocator, state, sizeof(struct fs_dir_iter_state));
+}
+
+iter_t fs_dir_iter(string_t path, uint32_t want, allocator_t a, fs_err_t *err)
+{
+    filec_dir_t *dir;
+    fs_err_t open_err = filec_dir_open(path, want, a, &dir);
+    if (!fs_ok(open_err))
+    {
+        if (err)
+        {
+            *err = open_err;
+        }
+
+        return (iter_t){0};
+    }
+
+    struct fs_dir_iter_state *state = mem_alloc(
+        a,
+        sizeof(struct fs_dir_iter_state),
+        _Alignof(struct fs_dir_iter_state));
+    if (!state)
+    {
+        if (err)
+        {
+            *err = (fs_err_t){FS_ERR_OOM, 0};
+        }
+        filec_dir_close(dir);
+        return (iter_t){0};
+    }
+    if (err)
+    {
+        *err = (fs_err_t){FS_OK, 0};
+    }
+    state->dir = dir;
+    state->done = false;
+    state->err = err;
+    return (iter_t){
+        .next = fs_dir_iter_next,
+        .destroy = fs_dir_iter_destroy,
+        .state = state,
+        .elem_size = sizeof(fs_entry_t),
+        .allocator = a};
+}

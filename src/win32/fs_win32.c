@@ -210,6 +210,13 @@ static HANDLE open_for_metadata(const wchar_t *w, bool follow)
 
 /* A reparse point is a link only for these tags; others (OneDrive
  * placeholders, dedup, ...) are ordinary files and directories. */
+static bool is_link_tag(DWORD tag)
+{
+    return tag == IO_REPARSE_TAG_SYMLINK
+           || tag == IO_REPARSE_TAG_MOUNT_POINT; /* junction */
+}
+
+/* Whether the open handle h (with attributes attrs) is a link. */
 static bool is_link(HANDLE h, DWORD attrs)
 {
     if (!(attrs & FILE_ATTRIBUTE_REPARSE_POINT))
@@ -222,8 +229,47 @@ static bool is_link(HANDLE h, DWORD attrs)
     {
         return false;
     }
-    return tag.ReparseTag == IO_REPARSE_TAG_SYMLINK
-           || tag.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT; /* junction */
+    return is_link_tag(tag.ReparseTag);
+}
+
+/* Everything but the name and the identity, from what both
+ * GetFileInformationByHandle (fs_stat) and FindFirstFileW (listings)
+ * give.  One place, so fs_stat and a listing cannot disagree. */
+static void entry_from_attrs(
+    DWORD attrs,
+    DWORD size_high,
+    DWORD size_low,
+    FILETIME mtime,
+    FILETIME btime,
+    bool link,
+    fs_entry_t *out)
+{
+    bool dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    out->kind = link ? FS_KIND_LINK : dir ? FS_KIND_DIR : FS_KIND_FILE;
+    out->size = dir ? 0 : ((uint64_t)size_high << 32) | size_low;
+    out->mtime_ns = unix_ns(mtime);
+    out->btime_ns = unix_ns(btime);
+
+    /* Windows has no permission bits: synthesise them from the read-only
+     * attribute, as the C runtime's stat() does. */
+    bool readonly = (attrs & FILE_ATTRIBUTE_READONLY) != 0;
+    out->mode = 0444u | (readonly ? 0u : 0222u) | (dir ? 0111u : 0u);
+
+    if (attrs & FILE_ATTRIBUTE_HIDDEN)
+    {
+        out->flags |= FS_FLAG_HIDDEN;
+    }
+    if (readonly)
+    {
+        out->flags |= FS_FLAG_READONLY;
+    }
+    if (attrs & FILE_ATTRIBUTE_SYSTEM)
+    {
+        out->flags |= FS_FLAG_SYSTEM;
+    }
+
+    /* NTFS records the birth time too */
+    out->valid = FS_F_ALL & ~(uint32_t)FS_F_ID;
 }
 
 fs_err_t fs_stat(string_t path, uint32_t want, uint32_t flags, fs_entry_t *out)
@@ -258,38 +304,20 @@ fs_err_t fs_stat(string_t path, uint32_t want, uint32_t flags, fs_entry_t *out)
     CloseHandle(h);
 
     memset(out, 0, sizeof *out);
+    entry_from_attrs(
+        attrs,
+        info.nFileSizeHigh,
+        info.nFileSizeLow,
+        info.ftLastWriteTime,
+        info.ftCreationTime,
+        link,
+        out);
     out->name = path_file_name(path);
-
-    bool dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-    out->kind = link ? FS_KIND_LINK : dir ? FS_KIND_DIR : FS_KIND_FILE;
-    out->size =
-        dir ? 0 : ((uint64_t)info.nFileSizeHigh << 32) | info.nFileSizeLow;
-    out->mtime_ns = unix_ns(info.ftLastWriteTime);
-    out->btime_ns = unix_ns(info.ftCreationTime);
-
-    /* Windows has no permission bits: synthesise them from the read-only
-     * attribute, as the C runtime's stat() does. */
-    bool readonly = (attrs & FILE_ATTRIBUTE_READONLY) != 0;
-    out->mode = 0444u | (readonly ? 0u : 0222u) | (dir ? 0111u : 0u);
-
-    if (attrs & FILE_ATTRIBUTE_HIDDEN)
-    {
-        out->flags |= FS_FLAG_HIDDEN;
-    }
-    if (readonly)
-    {
-        out->flags |= FS_FLAG_READONLY;
-    }
-    if (attrs & FILE_ATTRIBUTE_SYSTEM)
-    {
-        out->flags |= FS_FLAG_SYSTEM;
-    }
 
     /* (volume serial, file index) identify a file, like (dev, ino). */
     out->dev = info.dwVolumeSerialNumber;
     out->ino = ((uint64_t)info.nFileIndexHigh << 32) | info.nFileIndexLow;
-
-    out->valid = FS_F_ALL; /* NTFS records the birth time too */
+    out->valid |= FS_F_ID;
     return ok;
 }
 
@@ -685,4 +713,263 @@ fs_err_t fs_write_atomic(string_t path, string_t data)
         DeleteFileW(tmp);
     }
     return err;
+}
+
+/* --- Reading directories ------------------------------------------------ */
+
+/* The POSIX backend's pieces, one for one:
+ *
+ *   opendir / readdir / closedir   FindFirstFileExW / FindNextFileW /
+ *                                  FindClose; the first entry comes with
+ *                                  the open, so it is kept for the first
+ *                                  filec_dir_next
+ *   d_type, fstatat                WIN32_FIND_DATAW has kind (attributes,
+ *                                  and the reparse tag in dwReserved0),
+ *                                  size, times and attributes for free —
+ *                                  only FS_F_ID needs the file opened
+ *   d_name (bytes)                 cFileName (UTF-16), converted to UTF-8
+ *                                  into the name buffer
+ *
+ * FindExInfoBasic leaves out the 8.3 short name nobody asked for, and
+ * FIND_FIRST_EX_LARGE_FETCH fetches many entries per call, as getdents
+ * does under readdir. */
+
+/* A name is at most 255 UTF-16 units; each becomes at most 3 UTF-8 bytes
+ * (a surrogate pair: 2 units, 4 bytes). */
+#define NAME_UTF8_MAX (3 * 255 + 1)
+
+struct filec_dir_t
+{
+    HANDLE find;
+    allocator_t a;
+    uint32_t want;
+    bool pending; /* fd holds an entry not yet handed out (the first) */
+    bool done;
+    WIN32_FIND_DATAW fd;
+    size_t dir_len;         /* units of dir, ending in a backslash */
+    wchar_t dir[WPATH_MAX]; /* "\\?\C:\x\": for opening an entry (FS_F_ID) */
+    char name[NAME_UTF8_MAX];
+};
+
+/* POSIX says ENOTDIR when the path, or a component on the way, is a file;
+ * Windows says "not found" (or "the directory name is invalid").  Find the
+ * nearest part of path that exists: a file there means NOT_DIR. */
+static fs_err_t not_dir_on_the_way(string_t path, fs_err_t err)
+{
+    if (err.kind != FS_ERR_NOT_FOUND && err.kind != FS_ERR_NOT_DIR)
+    {
+        return err;
+    }
+    for (string_t p = path;;)
+    {
+        DWORD attrs = attributes_of(p);
+        if (attrs != INVALID_FILE_ATTRIBUTES)
+        {
+            if (!(attrs & FILE_ATTRIBUTE_DIRECTORY))
+            {
+                err.kind = FS_ERR_NOT_DIR;
+            }
+            else if (err.kind == FS_ERR_NOT_DIR && p.len != path.len)
+            {
+                err.kind = FS_ERR_NOT_FOUND; /* a directory, then nothing */
+            }
+            return err;
+        }
+        string_t parent = path_parent(p);
+        if (parent.len == 0 || parent.len >= p.len)
+        {
+            return err;
+        }
+        p = parent;
+    }
+}
+
+fs_err_t filec_dir_open(
+    string_t path, uint32_t want, allocator_t a, filec_dir_t **out)
+{
+    if (!out)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    *out = NULL;
+
+    wchar_t w[WPATH_MAX];
+    fs_err_t err = to_wide(path, w);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+
+    filec_dir_t *d = mem_alloc(a, sizeof *d, _Alignof(filec_dir_t));
+    if (!d)
+    {
+        return (fs_err_t){FS_ERR_OOM, 0};
+    }
+    memset(d, 0, offsetof(filec_dir_t, fd)); /* the small fields */
+    d->a = a;
+    d->want = want;
+
+    /* dir = w with a trailing backslash ("\\?\C:\" has one already), and
+     * the search pattern dir + "*" after it. */
+    size_t n = wcslen(w);
+    if (n + 2 >= WPATH_MAX)
+    {
+        mem_free(a, d, sizeof *d);
+        return (fs_err_t){FS_ERR_NAME_TOO_LONG, 0};
+    }
+    wmemcpy(d->dir, w, n);
+    if (d->dir[n - 1] != L'\\')
+    {
+        d->dir[n++] = L'\\';
+    }
+    d->dir_len = n;
+    d->dir[n] = L'*';
+    d->dir[n + 1] = L'\0';
+
+    d->find = FindFirstFileExW(
+        d->dir,
+        FindExInfoBasic,
+        &d->fd,
+        FindExSearchNameMatch,
+        NULL,
+        FIND_FIRST_EX_LARGE_FETCH);
+    d->dir[n] = L'\0';
+    if (d->find == INVALID_HANDLE_VALUE)
+    {
+        DWORD code = GetLastError();
+        DWORD attrs = GetFileAttributesW(w);
+        if (code == ERROR_FILE_NOT_FOUND && attrs != INVALID_FILE_ATTRIBUTES
+            && (attrs & FILE_ATTRIBUTE_DIRECTORY))
+        {
+            d->done = true; /* a directory without even "." (a drive root) */
+            *out = d;
+            return ok;
+        }
+        mem_free(a, d, sizeof *d);
+        return not_dir_on_the_way(path, win_err(code));
+    }
+    d->pending = true;
+    *out = d;
+    return ok;
+}
+
+/* The identity of dir\name, which the find data does not have: open it
+ * (attributes only, not following a link) and ask. */
+static fs_err_t entry_id(filec_dir_t *d, const wchar_t *name, fs_entry_t *e)
+{
+    size_t len = wcslen(name);
+    if (d->dir_len + len + 1 > WPATH_MAX)
+    {
+        return (fs_err_t){FS_ERR_NAME_TOO_LONG, 0};
+    }
+    wchar_t full[WPATH_MAX];
+    wmemcpy(full, d->dir, d->dir_len);
+    wmemcpy(full + d->dir_len, name, len + 1);
+
+    HANDLE h = open_for_metadata(full, false);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        return last_err();
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    fs_err_t err = ok;
+    if (GetFileInformationByHandle(h, &info))
+    {
+        e->dev = info.dwVolumeSerialNumber;
+        e->ino = ((uint64_t)info.nFileIndexHigh << 32) | info.nFileIndexLow;
+        e->valid |= FS_F_ID;
+    }
+    else
+    {
+        err = last_err();
+    }
+    CloseHandle(h);
+    return err;
+}
+
+fs_err_t filec_dir_next(filec_dir_t *d, fs_entry_t *e, bool *done)
+{
+    if (!d || !e || !done)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    for (;;)
+    {
+        if (d->done)
+        {
+            *done = true;
+            return ok;
+        }
+        if (d->pending)
+        {
+            d->pending = false;
+        }
+        else if (!FindNextFileW(d->find, &d->fd))
+        {
+            DWORD code = GetLastError();
+            if (code == ERROR_NO_MORE_FILES)
+            {
+                d->done = true;
+                continue;
+            }
+            return win_err(code);
+        }
+
+        const wchar_t *wn = d->fd.cFileName;
+        if (wn[0] == L'.'
+            && (wn[1] == L'\0' || (wn[1] == L'.' && wn[2] == L'\0')))
+        {
+            continue; /* skip "." and ".." */
+        }
+
+        /* UTF-16 -> UTF-8.  A lone surrogate (legal in NTFS names, not in
+         * UTF-16) becomes U+FFFD: such a name can be shown, not reopened. */
+        int bytes = WideCharToMultiByte(
+            CP_UTF8, 0, wn, -1, d->name, (int)sizeof d->name, NULL, NULL);
+        if (bytes <= 0)
+        {
+            return last_err();
+        }
+
+        DWORD attrs = d->fd.dwFileAttributes;
+        bool link = (attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+                    && is_link_tag(d->fd.dwReserved0);
+        memset(e, 0, sizeof *e);
+        entry_from_attrs(
+            attrs,
+            d->fd.nFileSizeHigh,
+            d->fd.nFileSizeLow,
+            d->fd.ftLastWriteTime,
+            d->fd.ftCreationTime,
+            link,
+            e);
+        e->name = (string_t){d->name, (size_t)bytes - 1};
+
+        if (d->want & FS_F_ID)
+        {
+            fs_err_t err = entry_id(d, wn, e);
+            if (err.kind == FS_ERR_NOT_FOUND)
+            {
+                continue; /* removed since it was listed: skip it */
+            }
+            if (!fs_ok(err))
+            {
+                return err;
+            }
+        }
+        *done = false;
+        return ok;
+    }
+}
+
+void filec_dir_close(filec_dir_t *d)
+{
+    if (d)
+    {
+        if (d->find && d->find != INVALID_HANDLE_VALUE)
+        {
+            FindClose(d->find);
+        }
+        mem_free(d->a, d, sizeof *d);
+    }
 }

@@ -3,12 +3,14 @@
  */
 #define _XOPEN_SOURCE 700
 #define _DARWIN_C_SOURCE /* macOS: st_mtimespec, st_birthtimespec */
+#define _DEFAULT_SOURCE
 
 #include "filec/fs.h"
 #include "filec/path.h"
 #include <stdint.h>
 
 #include "../fs_internal.h"
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -18,6 +20,13 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+struct filec_dir_t
+{
+    DIR *dir;
+    allocator_t a;
+    uint32_t want;
+};
 
 static fs_err_t filec_from_errno(int e)
 {
@@ -54,6 +63,37 @@ static fs_err_t filec_from_errno(int e)
     default:
         return (fs_err_t){.kind = FS_ERR_IO, e};
     }
+}
+
+static void entry_from_stat(const struct stat *st, fs_entry_t *e)
+{
+    if (S_ISREG(st->st_mode))
+    {
+        e->kind = FS_KIND_FILE;
+    }
+    else if (S_ISDIR(st->st_mode))
+    {
+        e->kind = FS_KIND_DIR;
+    }
+    else if (S_ISLNK(st->st_mode))
+    {
+        e->kind = FS_KIND_LINK;
+    }
+    else
+    {
+        e->kind = FS_KIND_OTHER;
+    }
+    e->size = (uint64_t)st->st_size;
+    e->mode = (uint32_t)(st->st_mode & 07777);
+    e->dev = st->st_dev;
+    e->ino = st->st_ino;
+#ifdef __APPLE__
+    struct timespec mt = st->st_mtimespec;
+#else
+    struct timespec mt = st->st_mtim;
+#endif
+    e->mtime_ns = (int64_t)mt.tv_sec * 1000000000 + mt.tv_nsec;
+    e->valid = FS_F_ALL & ~(uint32_t)FS_F_BTIME;
 }
 
 fs_err_t fs_mkdir(string_t path)
@@ -136,43 +176,14 @@ fs_err_t fs_stat(string_t path, uint32_t want, uint32_t flags, fs_entry_t *out)
 
     memset(out, 0, sizeof *out);
 
+    entry_from_stat(&st, out);
+
     out->name = path_file_name(path);
-
-    if (S_ISREG(st.st_mode))
-    {
-        out->kind = FS_KIND_FILE;
-    }
-    else if (S_ISDIR(st.st_mode))
-    {
-        out->kind = FS_KIND_DIR;
-    }
-    else if (S_ISLNK(st.st_mode))
-    {
-        out->kind = FS_KIND_LINK;
-    }
-    else
-    {
-        out->kind = FS_KIND_OTHER;
-    }
-
-    out->size = (uint64_t)st.st_size;
-    out->mode = (uint32_t)(st.st_mode & 07777);
-    out->dev = st.st_dev;
-    out->ino = st.st_ino;
 
     if (out->name.len > 0 && out->name.ptr[0] == '.')
     {
         out->flags |= FS_FLAG_HIDDEN;
     }
-
-#ifdef __APPLE__
-    struct timespec mt = st.st_mtimespec;
-#else
-    struct timespec mt = st.st_mtim;
-#endif
-    out->mtime_ns = (int64_t)mt.tv_sec * 1000000000 + mt.tv_nsec;
-
-    out->valid = FS_F_ALL & ~(uint32_t)FS_F_BTIME;
 
     return (fs_err_t){FS_OK, 0};
 }
@@ -459,4 +470,131 @@ err_close_unlink:
     fs_close(f_tmp);
     unlink(tmp_buf);
     return err;
+}
+
+fs_err_t filec_dir_open(
+    string_t path, uint32_t want, allocator_t a, filec_dir_t **out)
+{
+    if (!out)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    *out = NULL;
+
+    char path_buf[FILEC_PATH_BUF_MAX];
+
+    fs_err_t err = filec_path_cstr(path, path_buf, FILEC_PATH_BUF_MAX);
+    if (err.kind != FS_OK)
+    {
+        return err;
+    }
+
+    filec_dir_t *d = mem_alloc(a, sizeof *d, _Alignof(filec_dir_t));
+    if (!d)
+    {
+        return (fs_err_t){FS_ERR_OOM, 0};
+    }
+    d->dir = opendir(path_buf);
+    if (!d->dir)
+    {
+        int e = errno; /* mem_free may change errno */
+        mem_free(a, d, sizeof *d);
+        return filec_from_errno(e);
+    }
+    d->a = a;
+    d->want = want;
+    *out = d;
+
+    return (fs_err_t){FS_OK, 0};
+}
+
+static fs_kind_t kind_from_d_type(unsigned char d_type)
+{
+    switch (d_type)
+    {
+    case DT_REG:
+        return FS_KIND_FILE;
+    case DT_DIR:
+        return FS_KIND_DIR;
+    case DT_LNK:
+        return FS_KIND_LINK;
+    default:
+        return FS_KIND_OTHER;
+    }
+}
+
+fs_err_t filec_dir_next(filec_dir_t *d, fs_entry_t *e, bool *done)
+{
+    if (!d || !e || !done)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+
+    while (true)
+    {
+        errno = 0;
+        struct dirent *entry = readdir(d->dir);
+        if (!entry)
+        {
+            if (errno)
+            {
+                return filec_from_errno(errno);
+            }
+            *done = true;
+            return (fs_err_t){FS_OK, 0};
+        }
+
+        if (entry->d_name[0] == '.'
+            && (entry->d_name[1] == '\0'
+                || (entry->d_name[1] == '.' && entry->d_name[2] == '\0')))
+        {
+            continue; /* skip "." and ".." */
+        }
+
+        memset(e, 0, sizeof *e);
+
+        bool need_stat =
+            (d->want & (FS_F_SIZE | FS_F_MTIME | FS_F_MODE | FS_F_ID))
+            || entry->d_type == DT_UNKNOWN;
+
+        if (need_stat)
+        {
+            struct stat st;
+            if (fstatat(dirfd(d->dir), entry->d_name, &st, AT_SYMLINK_NOFOLLOW)
+                == -1)
+            {
+                if (errno == ENOENT)
+                {
+                    continue;
+                }
+                return filec_from_errno(errno);
+            }
+            entry_from_stat(&st, e);
+        }
+        else
+        {
+            e->kind = kind_from_d_type(entry->d_type);
+            e->valid = FS_F_KIND;
+        }
+
+        if (entry->d_name[0] == '.')
+        {
+            e->flags |= FS_FLAG_HIDDEN;
+        }
+
+        e->valid |= FS_F_FLAGS;
+        e->name = (string_t){entry->d_name, strlen(entry->d_name)};
+        *done = false;
+
+        return (fs_err_t){FS_OK, 0};
+    }
+}
+
+void filec_dir_close(filec_dir_t *d)
+{
+    if (d)
+    {
+        closedir(d->dir);
+        mem_free(d->a, d, sizeof *d);
+    }
 }
