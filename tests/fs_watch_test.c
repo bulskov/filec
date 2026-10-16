@@ -228,8 +228,12 @@ TEST(watch_sees_a_file_modified)
     create_watcher();
     uint32_t id = watch("d");
     ASSERT_TRUE(fx_write_file("d/f", "a new, longer content"));
+#ifdef __APPLE__
+    (void)id; /* kqueue does not see a file rewritten in place (fs.h) */
+#else
     collect(3000);
     ASSERT_TRUE(expect(id, FS_W_MODIFIED, "f"));
+#endif
 }
 
 /* Both names, where the system tells them. */

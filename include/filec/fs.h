@@ -435,9 +435,11 @@ FS_NODISCARD fs_err_t fs_space(string_t path, uint64_t *total, uint64_t *avail);
  * What each system tells:
  *   Linux     inotify: every kind, with the entry's name
  *   Windows   ReadDirectoryChangesW: every kind, with the name
- *   macOS     kqueue: only THAT the directory changed — FS_W_MODIFIED
- *             with name "" (and FS_W_DELETED, name "", when the watched
- *             directory itself goes)
+ *   macOS     kqueue: only THAT the directory's entries changed (one
+ *             added, removed or renamed) — FS_W_MODIFIED with name "" (and
+ *             FS_W_DELETED, name "", when the watched directory itself
+ *             goes).  A file rewritten in place is NOT seen; FSEvents
+ *             would see it (a later improvement).
  * So: an event with name "" means "something in here changed, re-read
  * it".  A rename comes as two FS_W_RENAMED events where the system tells
  * both names (old, then new), and a change of content may come as more
