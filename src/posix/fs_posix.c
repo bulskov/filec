@@ -1150,3 +1150,352 @@ fs_err_t fs_from_native(string_t native, strbuf_t *out)
     memcpy(buf + n, native.ptr, native.len);
     return append_from_native((string_t){buf, n + native.len}, out);
 }
+
+/* --- Volumes (step 6, tests/fs_volume_test.c) ----------------------------- */
+
+#include <sys/statvfs.h>
+#if defined(__APPLE__)
+#include <sys/mount.h>
+#include <sys/param.h>
+#endif
+
+/* Appends v (its strings copied into a) to out; false: out of memory. */
+static bool push_volume(
+    allocator_t a,
+    vec_t *out,
+    const char *path,
+    size_t path_len,
+    const char *label,
+    size_t label_len,
+    fs_volume_t v)
+{
+    return filec_dup_string(a, path, path_len, &v.path)
+           && filec_dup_string(a, label, label_len, &v.label)
+           && vec_push(out, &v) == SEQC_OK;
+}
+
+#if defined(__linux__)
+
+/* Undoes mountinfo's octal escapes (\040 for a space ...) in place. */
+static size_t unescape_octal(char *s)
+{
+    size_t r = 0, w = 0;
+    while (s[r])
+    {
+        if (s[r] == '\\' && s[r + 1] >= '0' && s[r + 1] <= '3'
+            && s[r + 2] >= '0' && s[r + 2] <= '7' && s[r + 3] >= '0'
+            && s[r + 3] <= '7')
+        {
+            s[w++] = (char)((s[r + 1] - '0') * 64 + (s[r + 2] - '0') * 8
+                            + (s[r + 3] - '0'));
+            r += 4;
+        }
+        else
+        {
+            s[w++] = s[r++];
+        }
+    }
+    s[w] = '\0';
+    return w;
+}
+
+static bool in_list(const char *s, const char *const *list)
+{
+    for (; *list; list++)
+    {
+        if (strcmp(s, *list) == 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *const network_fs[] = {
+    "nfs",
+    "nfs4",
+    "cifs",
+    "smb3",
+    "smbfs",
+    "ceph",
+    "glusterfs",
+    "afs",
+    "9p",
+    "fuse.sshfs",
+    "fuse.rclone",
+    "davfs",
+    NULL};
+
+/* Block devices that are not where a user keeps files. */
+static const char *const hidden_fs[] = {"squashfs", "swap", NULL};
+
+/* A small file's first line (a /sys attribute) into buf. */
+static bool read_small(const char *path, char *buf, size_t size)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        return false;
+    }
+    ssize_t n = read(fd, buf, size - 1);
+    close(fd);
+    if (n <= 0)
+    {
+        return false;
+    }
+    buf[n] = '\0';
+    return true;
+}
+
+/* Removable: /sys says so for the disk (a partition's parent), or the
+ * device hangs off USB. */
+static bool is_removable(const char *majmin)
+{
+    char p[128], v[16];
+    snprintf(p, sizeof p, "/sys/dev/block/%s/removable", majmin);
+    if (read_small(p, v, sizeof v) && v[0] == '1')
+    {
+        return true;
+    }
+    snprintf(p, sizeof p, "/sys/dev/block/%s/../removable", majmin);
+    if (read_small(p, v, sizeof v) && v[0] == '1')
+    {
+        return true;
+    }
+    snprintf(p, sizeof p, "/sys/dev/block/%s", majmin);
+    char real[PATH_MAX];
+    return realpath(p, real) && strstr(real, "/usb") != NULL;
+}
+
+/* The label of the block device source, from /dev/disk/by-label (udev
+ * escapes a space as \x20 there), into buf; "" if it has none. */
+static size_t device_label(const char *source, char *buf, size_t size)
+{
+    buf[0] = '\0';
+    char dev[PATH_MAX];
+    if (!realpath(source, dev))
+    {
+        return 0;
+    }
+    DIR *d = opendir("/dev/disk/by-label");
+    if (!d)
+    {
+        return 0;
+    }
+    size_t len = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL)
+    {
+        char link[PATH_MAX], target[PATH_MAX];
+        snprintf(link, sizeof link, "/dev/disk/by-label/%s", e->d_name);
+        if (e->d_name[0] == '.' || !realpath(link, target)
+            || strcmp(target, dev) != 0)
+        {
+            continue;
+        }
+        for (const char *s = e->d_name; *s && len + 1 < size;)
+        {
+            unsigned hex;
+            if (s[0] == '\\' && s[1] == 'x' && sscanf(s + 2, "%2x", &hex) == 1)
+            {
+                buf[len++] = (char)hex;
+                s += 4;
+            }
+            else
+            {
+                buf[len++] = *s++;
+            }
+        }
+        buf[len] = '\0';
+        break;
+    }
+    closedir(d);
+    return len;
+}
+
+/* One line of /proc/self/mountinfo:
+ *   id parent maj:min root mountpoint options [optional...] - type source
+ * superoptions.  Appends it to out if it is a volume.  false: out of
+ * memory. */
+static bool mountinfo_line(char *line, allocator_t a, vec_t *out)
+{
+    char *field[6];
+    char *save = NULL;
+    for (int i = 0; i < 6; i++)
+    {
+        field[i] = strtok_r(i ? NULL : line, " ", &save);
+        if (!field[i])
+        {
+            return true;
+        }
+    }
+    char *t;
+    while ((t = strtok_r(NULL, " ", &save)) != NULL && strcmp(t, "-") != 0)
+    {
+    }
+    char *type = t ? strtok_r(NULL, " ", &save) : NULL;
+    char *source = type ? strtok_r(NULL, " ", &save) : NULL;
+    if (!source)
+    {
+        return true;
+    }
+    char *mount = field[4];
+    size_t mount_len = unescape_octal(mount);
+    unescape_octal(source);
+
+    bool root = strcmp(mount, "/") == 0;
+    bool network = in_list(type, network_fs);
+    bool block = strncmp(source, "/dev/", 5) == 0 && !in_list(type, hidden_fs);
+    if (!root && !network && !block)
+    {
+        return true; /* proc, sysfs, cgroup, tmpfs, overlay, ... */
+    }
+
+    const char *opts = field[5];
+    fs_volume_t v = {0};
+    v.network = network;
+    v.read_only = strcmp(opts, "ro") == 0 || strncmp(opts, "ro,", 3) == 0;
+    v.removable = block && is_removable(field[2]);
+    char label[256];
+    size_t label_len = block ? device_label(source, label, sizeof label) : 0;
+    return push_volume(a, out, mount, mount_len, label, label_len, v);
+}
+
+static fs_err_t list_volumes(allocator_t a, vec_t *out)
+{
+    int fd = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        return filec_from_errno(errno);
+    }
+    char buf[64 * 1024];
+    size_t have = 0;
+    fs_err_t err = posix_ok;
+    for (;;)
+    {
+        ssize_t n = read(fd, buf + have, sizeof buf - 1 - have);
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (n < 0)
+        {
+            err = filec_from_errno(errno);
+            break;
+        }
+        have += (size_t)n;
+        buf[have] = '\0';
+        char *start = buf;
+        char *nl;
+        while ((nl = memchr(start, '\n', have - (size_t)(start - buf))))
+        {
+            *nl = '\0';
+            if (!mountinfo_line(start, a, out))
+            {
+                err = (fs_err_t){FS_ERR_OOM, 0};
+                break;
+            }
+            start = nl + 1;
+        }
+        if (!fs_ok(err) || n == 0)
+        {
+            break;
+        }
+        have -= (size_t)(start - buf);
+        memmove(buf, start, have);
+        if (have == sizeof buf - 1)
+        {
+            err = (fs_err_t){FS_ERR_IO, 0}; /* a line longer than buf */
+            break;
+        }
+    }
+    close(fd);
+    return err;
+}
+
+#elif defined(__APPLE__)
+
+static fs_err_t list_volumes(allocator_t a, vec_t *out)
+{
+    struct statfs *m = NULL;
+    int n = getmntinfo(&m, MNT_NOWAIT);
+    if (n <= 0)
+    {
+        return filec_from_errno(errno);
+    }
+    for (int i = 0; i < n; i++)
+    {
+        bool root = strcmp(m[i].f_mntonname, "/") == 0;
+        if (!root
+            && ((m[i].f_flags & MNT_DONTBROWSE)
+                || strcmp(m[i].f_fstypename, "devfs") == 0
+                || strcmp(m[i].f_fstypename, "autofs") == 0))
+        {
+            continue;
+        }
+        fs_volume_t v = {0};
+        v.network = !(m[i].f_flags & MNT_LOCAL);
+        v.read_only = (m[i].f_flags & MNT_RDONLY) != 0;
+#ifdef MNT_REMOVABLE
+        v.removable = (m[i].f_flags & MNT_REMOVABLE) != 0;
+#endif
+        const char *path = m[i].f_mntonname;
+        /* /Volumes/Name: Finder shows the name */
+        const char *label = strncmp(path, "/Volumes/", 9) == 0 ? path + 9 : "";
+        if (!push_volume(a, out, path, strlen(path), label, strlen(label), v))
+        {
+            return (fs_err_t){FS_ERR_OOM, 0};
+        }
+    }
+    return posix_ok;
+}
+
+#else
+
+static fs_err_t list_volumes(allocator_t a, vec_t *out)
+{
+    fs_volume_t v = {0};
+    return push_volume(a, out, "/", 1, "", 0, v) ? posix_ok
+                                                 : (fs_err_t){FS_ERR_OOM, 0};
+}
+
+#endif
+
+fs_err_t fs_volumes(allocator_t a, vec_t *out)
+{
+    if (!out || vec_elem_size(out) != sizeof(fs_volume_t))
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    size_t mark = vec_len(out);
+    fs_err_t err = list_volumes(a, out);
+    if (!fs_ok(err))
+    {
+        vec_truncate(out, mark);
+    }
+    return err;
+}
+
+fs_err_t fs_space(string_t path, uint64_t *total, uint64_t *avail)
+{
+    char buf[FILEC_PATH_BUF_MAX];
+    fs_err_t err = filec_path_cstr(path, buf, sizeof buf);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    struct statvfs st;
+    if (statvfs(buf, &st) != 0)
+    {
+        return filec_from_errno(errno);
+    }
+    if (total)
+    {
+        *total = (uint64_t)st.f_blocks * st.f_frsize;
+    }
+    if (avail)
+    {
+        *avail = (uint64_t)st.f_bavail * st.f_frsize;
+    }
+    return posix_ok;
+}

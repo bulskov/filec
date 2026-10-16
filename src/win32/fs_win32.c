@@ -30,6 +30,7 @@
 
 #include <string.h>
 #include <wchar.h>
+#include <wctype.h>
 
 /* --- Errors -------------------------------------------------------------- */
 
@@ -1568,4 +1569,121 @@ fs_err_t fs_from_native(string_t native, strbuf_t *out)
         return (fs_err_t){FS_ERR_NAME_TOO_LONG, 0};
     }
     return append_canonical(full, n, out);
+}
+
+/* --- Volumes (step 6, tests/fs_volume_test.c) -----------------------------
+ *
+ *   mountinfo / getmntinfo   the drive letters (GetLogicalDriveStringsW)
+ *   removable, network       GetDriveTypeW
+ *   label, read-only         GetVolumeInformationW — which fails for a
+ *                            drive without a medium (an empty card
+ *                            reader): listed anyway, without a label
+ *   statvfs                  GetDiskFreeSpaceExW */
+
+/* UTF-16 -> UTF-8 copied into a. */
+static bool dup_wide(allocator_t a, const wchar_t *w, string_t *out)
+{
+    char buf[3 * (MAX_PATH + 1)];
+    int n = WideCharToMultiByte(
+        CP_UTF8, 0, w, -1, buf, (int)sizeof buf, NULL, NULL);
+    return n > 0 && filec_dup_string(a, buf, (size_t)n - 1, out);
+}
+
+static fs_err_t list_volumes(allocator_t a, vec_t *out)
+{
+    wchar_t drives[26 * 4 + 1];
+    DWORD n = GetLogicalDriveStringsW(sizeof drives / sizeof drives[0], drives);
+    if (n == 0 || n > sizeof drives / sizeof drives[0])
+    {
+        return n ? (fs_err_t){FS_ERR_IO, 0} : last_err();
+    }
+    /* no "insert a disk" dialog for an empty drive */
+    DWORD old_mode;
+    SetThreadErrorMode(SEM_FAILCRITICALERRORS, &old_mode);
+    fs_err_t err = ok;
+    for (const wchar_t *root = drives; *root && fs_ok(err);
+         root += wcslen(root) + 1)
+    {
+        fs_volume_t v = {0};
+        UINT type = GetDriveTypeW(root);
+        v.removable = type == DRIVE_REMOVABLE || type == DRIVE_CDROM;
+        v.network = type == DRIVE_REMOTE;
+
+        wchar_t label[MAX_PATH + 1] = L"";
+        DWORD flags = 0;
+        if (!GetVolumeInformationW(
+                root, label, MAX_PATH + 1, NULL, NULL, &flags, NULL, 0))
+        {
+            label[0] = L'\0';
+        }
+        v.read_only = (flags & FILE_READ_ONLY_VOLUME) != 0;
+
+        char path[4] = {'/', (char)towupper(root[0]), ':', '\0'};
+        if (!filec_dup_string(a, path, 3, &v.path)
+            || !dup_wide(a, label, &v.label) || vec_push(out, &v) != SEQC_OK)
+        {
+            err = (fs_err_t){FS_ERR_OOM, 0};
+        }
+    }
+    SetThreadErrorMode(old_mode, NULL);
+    return err;
+}
+
+fs_err_t fs_volumes(allocator_t a, vec_t *out)
+{
+    if (!out || vec_elem_size(out) != sizeof(fs_volume_t))
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    size_t mark = vec_len(out);
+    fs_err_t err = list_volumes(a, out);
+    if (!fs_ok(err))
+    {
+        vec_truncate(out, mark);
+    }
+    return err;
+}
+
+fs_err_t fs_space(string_t path, uint64_t *total, uint64_t *avail)
+{
+    wchar_t w[WPATH_MAX];
+    fs_err_t err = to_wide(path, w);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    DWORD attrs = GetFileAttributesW(w);
+    if (attrs == INVALID_FILE_ATTRIBUTES)
+    {
+        return not_dir_on_the_way(path, last_err());
+    }
+    /* GetDiskFreeSpaceExW wants a directory, with a trailing backslash */
+    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY))
+    {
+        err = to_wide(path_parent(path), w);
+        if (!fs_ok(err))
+        {
+            return err;
+        }
+    }
+    size_t n = wcslen(w);
+    if (w[n - 1] != L'\\' && n + 1 < WPATH_MAX)
+    {
+        w[n] = L'\\';
+        w[n + 1] = L'\0';
+    }
+    ULARGE_INTEGER caller_avail, size;
+    if (!GetDiskFreeSpaceExW(w, &caller_avail, &size, NULL))
+    {
+        return last_err();
+    }
+    if (total)
+    {
+        *total = size.QuadPart;
+    }
+    if (avail)
+    {
+        *avail = caller_avail.QuadPart;
+    }
+    return ok;
 }

@@ -288,3 +288,19 @@ fs_err_t fs_mkdir_all(string_t path)
     }
     return err;
 }
+bool filec_dup_string(allocator_t a, const char *p, size_t n, string_t *out)
+{
+    if (n == 0)
+    {
+        *out = (string_t){"", 0};
+        return true;
+    }
+    char *copy = mem_alloc(a, n, 1);
+    if (!copy)
+    {
+        return false;
+    }
+    memcpy(copy, p, n);
+    *out = (string_t){copy, n};
+    return true;
+}

@@ -26,3 +26,7 @@ fs_err_t filec_dir_next(filec_dir_t *d, fs_entry_t *e, bool *done);
 
 /* Closes the OS handle and gives d back to its allocator.  NULL: no-op. */
 void filec_dir_close(filec_dir_t *d);
+
+/* n bytes from p copied into a, as a string_t that lives as long as a;
+ * n == 0 gives "".  false if a cannot allocate. */
+bool filec_dup_string(allocator_t a, const char *p, size_t n, string_t *out);

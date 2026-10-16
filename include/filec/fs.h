@@ -6,7 +6,7 @@
  * tests/fs_file_test.c.  Step 3 (reading directories):
  * tests/fs_dir_test.c.  Step 4 (mkdir_all, rename, copy_file, read_link,
  * real_path): tests/fs_ops_test.c.  Step 5 (cwd, location, from_native):
- * tests/fs_places_test.c.
+ * tests/fs_places_test.c.  Step 6 (volumes, space): tests/fs_volume_test.c.
  *
  * Paths:     every path in and out is CANONICAL, normalised and ABSOLUTE
  *            (see filec/path.h): "/C:/Users/me", not "C:\Users\me".  A
@@ -406,9 +406,24 @@ typedef struct
     bool read_only;
 } fs_volume_t;
 
-/* *out: a vec_t of fs_volume_t; it and its strings come from a.
- * Linux: /proc/self/mountinfo minus pseudo-fs. */
-FS_NODISCARD fs_err_t fs_volumes(allocator_t a, vec_t **out);
+/* The volumes a user would see, appended to out — a vec_t of fs_volume_t
+ * you created (another elem_size is FS_ERR_INVALID).  The strings are
+ * allocated from a and live as long as it.  On failure out is unchanged.
+ *
+ *   Linux     /proc/self/mountinfo: block devices and network filesystems,
+ *             not pseudo-filesystems (proc, sysfs, cgroup, tmpfs, snap
+ *             squashfs ...); the label from /dev/disk/by-label; removable
+ *             from /sys
+ *   macOS     getmntinfo, without what Finder hides (MNT_DONTBROWSE)
+ *   Windows   the drive letters (GetLogicalDriveStringsW), mapped network
+ *             drives and empty card readers included
+ *
+ * The root ("/" on POSIX) is always there; the order is the system's. */
+FS_NODISCARD fs_err_t fs_volumes(allocator_t a, vec_t *out);
+
+/* Size and free space of the volume that holds path (which must exist),
+ * in bytes: *avail is what this user may still write (less than the free
+ * space where the system keeps some back).  total or avail may be NULL. */
 FS_NODISCARD fs_err_t fs_space(string_t path, uint64_t *total, uint64_t *avail);
 
 /* --- Watching ------------------------------------------------------------ */
