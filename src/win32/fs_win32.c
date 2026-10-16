@@ -1687,3 +1687,383 @@ fs_err_t fs_space(string_t path, uint64_t *total, uint64_t *avail)
     }
     return ok;
 }
+
+/* --- Watching (step 7, tests/fs_watch_test.c) -----------------------------
+ *
+ *   inotify watch            a directory handle with an overlapped
+ *                            ReadDirectoryChangesW always pending into
+ *                            the watch's buffer
+ *   poll on the inotify fd   GetQueuedCompletionStatus on one completion
+ *                            port that every directory handle is tied to
+ *                            (no 64-handle limit, unlike
+ *                            WaitForMultipleObjects)
+ *   eventfd (wake)           PostQueuedCompletionStatus with key 0
+ *
+ * A watch's buffer belongs to the kernel while its read is pending, so a
+ * removed watch is only freed once its cancelled read has come back
+ * through the port — in fs_watch_wait, or in fs_watch_destroy. */
+
+typedef struct dir_watch
+{
+    struct dir_watch *next;
+    HANDLE dir;
+    uint32_t id;
+    bool removed; /* fs_watch_remove: hand out nothing more, free on return */
+    bool pending; /* a read is with the kernel */
+    OVERLAPPED ov;
+    DWORD buf[16 * 1024]; /* 64 KiB, DWORD-aligned as the API wants */
+} dir_watch_t;
+
+struct fs_watch_t
+{
+    allocator_t a;
+    HANDLE port;
+    SRWLOCK lock; /* watches, next_id, removed, pending */
+    dir_watch_t *watches;
+    uint32_t next_id;
+    /* the buffer being handed out, and how far */
+    dir_watch_t *cur;
+    DWORD cur_off, cur_len;
+    char names[64 * 1024]; /* this call's names, as UTF-8 */
+};
+
+#define WATCH_FILTER                                                           \
+    (FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME                \
+     | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE                 \
+     | FILE_NOTIFY_CHANGE_ATTRIBUTES)
+
+/* Gives the buffer to the kernel for the next changes. */
+static bool issue_read(dir_watch_t *d)
+{
+    memset(&d->ov, 0, sizeof d->ov);
+    d->pending = ReadDirectoryChangesW(
+        d->dir, d->buf, sizeof d->buf, FALSE, WATCH_FILTER, NULL, &d->ov, NULL);
+    return d->pending;
+}
+
+fs_err_t fs_watch_create(allocator_t a, fs_watch_t **out)
+{
+    if (!out)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    *out = NULL;
+    fs_watch_t *w = mem_alloc(a, sizeof *w, _Alignof(fs_watch_t));
+    if (!w)
+    {
+        return (fs_err_t){FS_ERR_OOM, 0};
+    }
+    memset(w, 0, offsetof(fs_watch_t, names));
+    w->a = a;
+    InitializeSRWLock(&w->lock);
+    w->port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
+    if (!w->port)
+    {
+        fs_err_t err = last_err();
+        mem_free(a, w, sizeof *w);
+        return err;
+    }
+    *out = w;
+    return ok;
+}
+
+fs_err_t fs_watch_add(fs_watch_t *w, string_t dir, uint32_t *id)
+{
+    if (!w || !id)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    wchar_t wd[WPATH_MAX];
+    fs_err_t err = to_wide(dir, wd);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    HANDLE h = CreateFileW(
+        wd,
+        FILE_LIST_DIRECTORY,
+        SHARE_ALL,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+        NULL);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        return not_dir_on_the_way(dir, last_err());
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    if (!GetFileInformationByHandle(h, &info)
+        || !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+    {
+        CloseHandle(h);
+        return (fs_err_t){FS_ERR_NOT_DIR, 0};
+    }
+
+    dir_watch_t *d = mem_alloc(w->a, sizeof *d, _Alignof(dir_watch_t));
+    if (!d)
+    {
+        CloseHandle(h);
+        return (fs_err_t){FS_ERR_OOM, 0};
+    }
+    memset(d, 0, offsetof(dir_watch_t, buf));
+    d->dir = h;
+    if (!CreateIoCompletionPort(h, w->port, (ULONG_PTR)d, 0))
+    {
+        err = last_err();
+        CloseHandle(h);
+        mem_free(w->a, d, sizeof *d);
+        return err;
+    }
+    AcquireSRWLockExclusive(&w->lock);
+    d->id = ++w->next_id;
+    if (!issue_read(d))
+    {
+        err = last_err();
+        ReleaseSRWLockExclusive(&w->lock);
+        CloseHandle(h);
+        mem_free(w->a, d, sizeof *d);
+        return err;
+    }
+    d->next = w->watches;
+    w->watches = d;
+    *id = d->id;
+    ReleaseSRWLockExclusive(&w->lock);
+    return ok;
+}
+
+void fs_watch_remove(fs_watch_t *w, uint32_t watch_id)
+{
+    if (!w)
+    {
+        return;
+    }
+    AcquireSRWLockExclusive(&w->lock);
+    for (dir_watch_t *d = w->watches; d; d = d->next)
+    {
+        if (d->id == watch_id && !d->removed)
+        {
+            d->removed = true;
+            /* closing the handle cancels the read; its completion comes
+             * back through the port, and then d is freed */
+            CloseHandle(d->dir);
+            d->dir = NULL;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&w->lock);
+}
+
+/* Unlinks d and gives it back (the lock is held). */
+static void free_watch(fs_watch_t *w, dir_watch_t *d)
+{
+    for (dir_watch_t **p = &w->watches; *p; p = &(*p)->next)
+    {
+        if (*p == d)
+        {
+            *p = d->next;
+            break;
+        }
+    }
+    if (w->cur == d)
+    {
+        w->cur = NULL;
+    }
+    mem_free(w->a, d, sizeof *d);
+}
+
+/* Hands out events from the current buffer; when it is used up, gives it
+ * back to the kernel.  *used: bytes of names taken so far. */
+static void hand_out(
+    fs_watch_t *w,
+    fs_watch_event_t *out,
+    size_t cap,
+    size_t *count,
+    size_t *used)
+{
+    dir_watch_t *d = w->cur;
+    while (d && *count < cap && w->cur_off < w->cur_len)
+    {
+        const FILE_NOTIFY_INFORMATION *fi =
+            (const FILE_NOTIFY_INFORMATION *)((const char *)d->buf
+                                              + w->cur_off);
+        size_t units = fi->FileNameLength / sizeof(WCHAR);
+        if (*used + 3 * units + 1 > sizeof w->names)
+        {
+            break; /* no room for the name: the next call */
+        }
+        int bytes = units ? WideCharToMultiByte(
+                                CP_UTF8,
+                                0,
+                                fi->FileName,
+                                (int)units,
+                                w->names + *used,
+                                (int)(sizeof w->names - *used),
+                                NULL,
+                                NULL)
+                          : 0;
+        fs_watch_event_t *e = &out[*count];
+        e->watch_id = d->id;
+        e->name = (string_t){w->names + *used, bytes > 0 ? (size_t)bytes : 0};
+        *used += bytes > 0 ? (size_t)bytes : 0;
+        switch (fi->Action)
+        {
+        case FILE_ACTION_ADDED:
+            e->kind = FS_W_CREATED;
+            break;
+        case FILE_ACTION_REMOVED:
+            e->kind = FS_W_DELETED;
+            break;
+        case FILE_ACTION_RENAMED_OLD_NAME:
+        case FILE_ACTION_RENAMED_NEW_NAME:
+            e->kind = FS_W_RENAMED;
+            break;
+        default:
+            e->kind = FS_W_MODIFIED;
+            break;
+        }
+        if (!d->removed)
+        {
+            (*count)++;
+        }
+        w->cur_off =
+            fi->NextEntryOffset ? w->cur_off + fi->NextEntryOffset : w->cur_len;
+    }
+    if (d && w->cur_off >= w->cur_len)
+    {
+        w->cur = NULL;
+        AcquireSRWLockExclusive(&w->lock);
+        if (d->removed || !issue_read(d))
+        {
+            if (!d->removed && d->dir)
+            {
+                CloseHandle(d->dir); /* the directory is gone */
+                d->dir = NULL;
+            }
+            free_watch(w, d); /* no read pending: nothing comes back */
+        }
+        ReleaseSRWLockExclusive(&w->lock);
+    }
+}
+
+fs_err_t fs_watch_wait(
+    fs_watch_t *w,
+    fs_watch_event_t *out,
+    size_t cap,
+    uint32_t timeout_ms,
+    size_t *count)
+{
+    if (count)
+    {
+        *count = 0;
+    }
+    if (!w || !out || cap == 0 || !count)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    size_t used = 0;
+    ULONGLONG start = GetTickCount64();
+    for (;;)
+    {
+        hand_out(w, out, cap, count, &used);
+        if (*count > 0)
+        {
+            return ok;
+        }
+        ULONGLONG spent = GetTickCount64() - start;
+        DWORD left = spent >= timeout_ms ? 0 : (DWORD)(timeout_ms - spent);
+        DWORD bytes = 0;
+        ULONG_PTR key = 0;
+        OVERLAPPED *ov = NULL;
+        BOOL got = GetQueuedCompletionStatus(w->port, &bytes, &key, &ov, left);
+        if (!ov)
+        {
+            /* a wake (key 0), or the time is up */
+            return got || GetLastError() == WAIT_TIMEOUT ? ok : last_err();
+        }
+        dir_watch_t *d = (dir_watch_t *)key;
+        AcquireSRWLockExclusive(&w->lock);
+        d->pending = false;
+        if (d->removed)
+        {
+            free_watch(w, d); /* its cancelled read is back */
+            ReleaseSRWLockExclusive(&w->lock);
+            continue;
+        }
+        ReleaseSRWLockExclusive(&w->lock);
+        if (!got)
+        {
+            /* the directory itself went away */
+            out[(*count)++] = (fs_watch_event_t){FS_W_DELETED, d->id, {"", 0}};
+            AcquireSRWLockExclusive(&w->lock);
+            CloseHandle(d->dir);
+            d->dir = NULL;
+            free_watch(w, d);
+            ReleaseSRWLockExclusive(&w->lock);
+            return ok;
+        }
+        if (bytes == 0)
+        {
+            /* more changes than the buffer held */
+            out[(*count)++] = (fs_watch_event_t){FS_W_OVERFLOW, d->id, {"", 0}};
+            AcquireSRWLockExclusive(&w->lock);
+            issue_read(d);
+            ReleaseSRWLockExclusive(&w->lock);
+            return ok;
+        }
+        w->cur = d;
+        w->cur_off = 0;
+        w->cur_len = bytes;
+    }
+}
+
+void fs_watch_wake(fs_watch_t *w)
+{
+    if (w)
+    {
+        PostQueuedCompletionStatus(w->port, 0, 0, NULL);
+    }
+}
+
+void fs_watch_destroy(fs_watch_t *w)
+{
+    if (!w)
+    {
+        return;
+    }
+    /* cancel every read, and wait for each to come back before its
+     * buffer is freed */
+    size_t pending = 0;
+    for (dir_watch_t *d = w->watches; d; d = d->next)
+    {
+        if (d->dir)
+        {
+            CloseHandle(d->dir);
+            d->dir = NULL;
+        }
+        pending += d->pending;
+    }
+    while (pending > 0)
+    {
+        DWORD bytes;
+        ULONG_PTR key;
+        OVERLAPPED *ov = NULL;
+        GetQueuedCompletionStatus(w->port, &bytes, &key, &ov, 5000);
+        if (!ov)
+        {
+            if (GetLastError() == WAIT_TIMEOUT)
+            {
+                break; /* should not happen; leak rather than free early */
+            }
+            continue; /* a wake */
+        }
+        pending--;
+    }
+    while (w->watches)
+    {
+        dir_watch_t *d = w->watches;
+        w->watches = d->next;
+        mem_free(w->a, d, sizeof *d);
+    }
+    CloseHandle(w->port);
+    mem_free(w->a, w, sizeof *w);
+}

@@ -7,6 +7,7 @@
  * tests/fs_dir_test.c.  Step 4 (mkdir_all, rename, copy_file, read_link,
  * real_path): tests/fs_ops_test.c.  Step 5 (cwd, location, from_native):
  * tests/fs_places_test.c.  Step 6 (volumes, space): tests/fs_volume_test.c.
+ * Step 7 (watching): tests/fs_watch_test.c.
  *
  * Paths:     every path in and out is CANONICAL, normalised and ABSOLUTE
  *            (see filec/path.h): "/C:/Users/me", not "C:\Users\me".  A
@@ -429,7 +430,19 @@ FS_NODISCARD fs_err_t fs_space(string_t path, uint64_t *total, uint64_t *avail);
 /* --- Watching ------------------------------------------------------------ */
 /* Events are hints, not truth: on FS_W_OVERFLOW (or whenever in doubt)
  * re-read the directory.  Watches are not recursive (inotify is not);
- * Windows' recursive mode is not exposed, to keep semantics identical. */
+ * Windows' recursive mode is not exposed, to keep semantics identical.
+ *
+ * What each system tells:
+ *   Linux     inotify: every kind, with the entry's name
+ *   Windows   ReadDirectoryChangesW: every kind, with the name
+ *   macOS     kqueue: only THAT the directory changed — FS_W_MODIFIED
+ *             with name "" (and FS_W_DELETED, name "", when the watched
+ *             directory itself goes)
+ * So: an event with name "" means "something in here changed, re-read
+ * it".  A rename comes as two FS_W_RENAMED events where the system tells
+ * both names (old, then new), and a change of content may come as more
+ * than one FS_W_MODIFIED.  The watched directory itself removed or moved:
+ * FS_W_DELETED with name "" (not on every system). */
 
 typedef enum
 {
@@ -449,19 +462,31 @@ typedef struct
 
 typedef struct fs_watch_t fs_watch_t;
 
+/* A watcher: w and what it needs come from a, and go back to it in
+ * fs_watch_destroy.  On failure *out is NULL. */
 FS_NODISCARD fs_err_t fs_watch_create(allocator_t a, fs_watch_t **out);
-/* add/remove may be called from any thread, also while another waits.
- * *id is never 0. */
+/* Watches the directory dir (followed if it is a link).  *id is never 0;
+ * events carry it.  Missing: FS_ERR_NOT_FOUND; not a directory:
+ * FS_ERR_NOT_DIR.  add and remove may be called from any thread, also
+ * while another one waits. */
 FS_NODISCARD fs_err_t fs_watch_add(fs_watch_t *w, string_t dir, uint32_t *id);
+/* No more events for watch_id after this returns (one already read may
+ * still be handed out).  An unknown id is a no-op. */
 void fs_watch_remove(fs_watch_t *w, uint32_t watch_id);
-/* Blocks until events, timeout or fs_watch_wake; sets *count.  Names are
- * views into w, valid until the next fs_watch_wait. */
+/* Blocks until there are events, timeout_ms has passed (0: just look) or
+ * fs_watch_wake is called; fills up to cap (>= 1) events and sets *count
+ * (0 on a timeout or a wake).  Events that do not fit wait for the next
+ * call.  Names are views into w, valid until the next fs_watch_wait.  One
+ * thread waits at a time. */
 FS_NODISCARD fs_err_t fs_watch_wait(
     fs_watch_t *w,
     fs_watch_event_t *out,
     size_t cap,
     uint32_t timeout_ms,
     size_t *count);
-/* Any thread: unblock a waiting fs_watch_wait (e.g. for shutdown). */
+/* Any thread: the waiting fs_watch_wait returns (count 0) — or, if none
+ * waits, the next one returns at once.  For shutdown. */
 void fs_watch_wake(fs_watch_t *w);
+/* Stops every watch and gives everything back.  Nobody may be waiting.
+ * NULL: no-op. */
 void fs_watch_destroy(fs_watch_t *w);
