@@ -255,3 +255,36 @@ iter_t fs_dir_iter(string_t path, uint32_t want, allocator_t a, fs_err_t *err)
         .elem_size = sizeof(fs_entry_t),
         .allocator = a};
 }
+
+fs_err_t fs_mkdir_all(string_t path)
+{
+    fs_err_t err = fs_mkdir(path);
+    if (fs_ok(err))
+    {
+        return err;
+    }
+    if (err.kind == FS_ERR_NOT_FOUND)
+    {
+        string_t parent = path_parent(path);
+        if (parent.len == 0 || parent.len >= path.len)
+        {
+            return err;
+        }
+        fs_err_t perr = fs_mkdir_all(parent);
+        if (!fs_ok(perr))
+        {
+            return perr; /* NOT_DIR for a file on the way */
+        }
+        return fs_mkdir_all(path); /* again: also handles a race */
+    }
+    if (err.kind == FS_ERR_EXISTS)
+    {
+        fs_entry_t entry;
+        if (fs_ok(fs_stat(path, FS_F_KIND, 0, &entry))
+            && entry.kind == FS_KIND_DIR)
+        {
+            return (fs_err_t){FS_OK, 0};
+        }
+    }
+    return err;
+}

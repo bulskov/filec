@@ -23,6 +23,7 @@
 #include "filec/fs.h"
 #include "filec/native.h"
 #include "filec/path.h"
+#include <stdatomic.h>
 
 #include "../fs_internal.h"
 #include "arena/fixed_arena.h"
@@ -765,6 +766,10 @@ static fs_err_t not_dir_on_the_way(string_t path, fs_err_t err)
         DWORD attrs = attributes_of(p);
         if (attrs != INVALID_FILE_ATTRIBUTES)
         {
+            if (attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+            {
+                return err; /* a link (dangling?): not a file in the way */
+            }
             if (!(attrs & FILE_ATTRIBUTE_DIRECTORY))
             {
                 err.kind = FS_ERR_NOT_DIR;
@@ -972,4 +977,464 @@ void filec_dir_close(filec_dir_t *d)
         }
         mem_free(d->a, d, sizeof *d);
     }
+}
+
+/* --- Renaming, copying, links (step 4, tests/fs_ops_test.c) ------------
+ *
+ * The POSIX backend's pieces, one for one:
+ *
+ *   lstat (dev, ino)                 volume serial + file index of a handle
+ *                                    opened for attributes (same_file)
+ *   rename / renameat2(NOREPLACE)    MoveFileExW with / without
+ *                                    MOVEFILE_REPLACE_EXISTING — the
+ *                                    "fail if it exists" is atomic already
+ *   copy_file_range + progress loop  CopyFileExW: the copy, its chunks and
+ *                                    its progress callback are the OS's; the
+ *                                    callback returns PROGRESS_CANCEL
+ *   futimens / fchmod                CopyFileExW keeps attributes and times
+ *                                    itself; without FS_KEEP_METADATA the
+ *                                    copy's mtime is set to now
+ *   readlink                         the reparse point's data
+ *                                    (FSCTL_GET_REPARSE_POINT)
+ *   realpath                         GetFinalPathNameByHandleW, which also
+ *                                    turns 8.3 names into long ones */
+
+#include <winioctl.h>
+
+/* The identity of what w names (following links or not): volume serial
+ * and file index, like (dev, ino). */
+static bool file_id(const wchar_t *w, bool follow, uint64_t id[2])
+{
+    HANDLE h = open_for_metadata(w, follow);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    bool got = GetFileInformationByHandle(h, &info);
+    CloseHandle(h);
+    if (got)
+    {
+        id[0] = info.dwVolumeSerialNumber;
+        id[1] = ((uint64_t)info.nFileIndexHigh << 32) | info.nFileIndexLow;
+    }
+    return got;
+}
+
+static bool same_file(const wchar_t *a, const wchar_t *b, bool follow)
+{
+    uint64_t ia[2], ib[2];
+    return file_id(a, follow, ia) && file_id(b, follow, ib) && ia[0] == ib[0]
+           && ia[1] == ib[1];
+}
+
+/* to is inside from: "d" -> "d/sub/d".  Canonical paths make it a prefix
+ * test. */
+static bool is_inside(string_t to, string_t from)
+{
+    return to.len > from.len && to.ptr[from.len] == '/'
+           && path_starts_with(to, from, PATH_CASE_NATIVE);
+}
+
+fs_err_t fs_rename(string_t from, string_t to, uint32_t flags)
+{
+    wchar_t wf[WPATH_MAX], wt[WPATH_MAX];
+    fs_err_t err = to_wide(from, wf);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    err = to_wide(to, wt);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    if (is_inside(to, from))
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    if (GetFileAttributesW(wf) == INVALID_FILE_ATTRIBUTES)
+    {
+        return not_dir_on_the_way(from, last_err());
+    }
+
+    DWORD to_attrs = GetFileAttributesW(wt);
+    if (to_attrs != INVALID_FILE_ATTRIBUTES)
+    {
+        if (same_file(wf, wt, false))
+        {
+            if (wcscmp(wf, wt) == 0)
+            {
+                return ok; /* to itself: nothing to do */
+            }
+            /* "abc" -> "ABC": the same entry, its case changes.  (Otherwise
+             * two hard links: to is in the way like any file.) */
+            if (path_equals(from, to, PATH_CASE_INSENSITIVE))
+            {
+                return MoveFileExW(wf, wt, 0) ? ok : last_err();
+            }
+        }
+        if (to_attrs & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            return (fs_err_t){
+                (flags & FS_REPLACE) ? FS_ERR_IS_DIR : FS_ERR_EXISTS, 0};
+        }
+        if (!(flags & FS_REPLACE))
+        {
+            return (fs_err_t){FS_ERR_EXISTS, 0};
+        }
+    }
+
+    /* No MOVEFILE_COPY_ALLOWED: across volumes is FS_ERR_CROSS_DEVICE. */
+    DWORD mf = (flags & FS_REPLACE) ? MOVEFILE_REPLACE_EXISTING : 0;
+    if (!MoveFileExW(wf, wt, mf))
+    {
+        return not_dir_on_the_way(to, last_err());
+    }
+    return ok;
+}
+
+static bool cancelled(const fs_op_t *op)
+{
+    return op && op->cancel && atomic_load(op->cancel);
+}
+
+/* CopyFileExW's progress callback: report, and stop when cancel is set. */
+static DWORD CALLBACK copy_progress(
+    LARGE_INTEGER total,
+    LARGE_INTEGER done,
+    LARGE_INTEGER stream_size,
+    LARGE_INTEGER stream_done,
+    DWORD stream,
+    DWORD reason,
+    HANDLE src,
+    HANDLE dst,
+    LPVOID user)
+{
+    (void)stream_size;
+    (void)stream_done;
+    (void)stream;
+    (void)reason;
+    (void)src;
+    (void)dst;
+    const fs_op_t *op = user;
+    if (op && op->progress)
+    {
+        op->progress(
+            op->user, (uint64_t)done.QuadPart, (uint64_t)total.QuadPart);
+    }
+    return cancelled(op) ? PROGRESS_CANCEL : PROGRESS_CONTINUE;
+}
+
+/* The modification time of the file at w: now. */
+static fs_err_t touch_mtime(const wchar_t *w)
+{
+    HANDLE h = CreateFileW(
+        w,
+        FILE_WRITE_ATTRIBUTES,
+        SHARE_ALL,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        return last_err();
+    }
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    fs_err_t err = SetFileTime(h, NULL, NULL, &now) ? ok : last_err();
+    CloseHandle(h);
+    return err;
+}
+
+/* Deletes w, read-only or not (CopyFileExW copies the attribute). */
+static void delete_file(const wchar_t *w)
+{
+    SetFileAttributesW(w, FILE_ATTRIBUTE_NORMAL);
+    DeleteFileW(w);
+}
+
+fs_err_t fs_copy_file(
+    string_t from, string_t to, uint32_t flags, const fs_op_t *op)
+{
+    wchar_t wf[WPATH_MAX], wt[WPATH_MAX];
+    fs_err_t err = to_wide(from, wf);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    err = to_wide(to, wt);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+
+    /* from, followed: a directory is IS_DIR, a dangling link NOT_FOUND. */
+    fs_entry_t src;
+    err = fs_stat(from, FS_F_KIND, 0, &src);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    if (src.kind == FS_KIND_DIR)
+    {
+        return (fs_err_t){FS_ERR_IS_DIR, 0};
+    }
+
+    /* What is at to: the same file (copying would empty it), a directory,
+     * or anything at all without FS_REPLACE. */
+    DWORD to_attrs = GetFileAttributesW(wt);
+    if (to_attrs != INVALID_FILE_ATTRIBUTES)
+    {
+        if (same_file(wf, wt, true))
+        {
+            return (fs_err_t){FS_ERR_INVALID, 0};
+        }
+        if (to_attrs & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            return (fs_err_t){FS_ERR_IS_DIR, 0};
+        }
+        if (!(flags & FS_REPLACE))
+        {
+            return (fs_err_t){FS_ERR_EXISTS, 0};
+        }
+    }
+    if (cancelled(op))
+    {
+        return (fs_err_t){FS_ERR_CANCELLED, 0};
+    }
+
+    /* The copy is written beside to and moved into place at the end, so
+     * an old file at to survives a cancel or an error. */
+    wchar_t tmp[WTMP_MAX];
+    unsigned long pid = (unsigned long)GetCurrentProcessId();
+    for (int i = 1;; i++)
+    {
+        if (i == 1000)
+        {
+            return (fs_err_t){FS_ERR_IO, 0};
+        }
+        swprintf(tmp, WTMP_MAX, L"%ls.tmp%lu.%03d", wt, pid, i);
+        if (CopyFileExW(
+                wf,
+                tmp,
+                copy_progress,
+                (LPVOID)op,
+                NULL,
+                COPY_FILE_FAIL_IF_EXISTS))
+        {
+            break;
+        }
+        DWORD code = GetLastError();
+        if (code == ERROR_FILE_EXISTS || code == ERROR_ALREADY_EXISTS)
+        {
+            continue;
+        }
+        DeleteFileW(tmp); /* CopyFileExW removes it; be sure */
+        if (code == ERROR_REQUEST_ABORTED)
+        {
+            return (fs_err_t){FS_ERR_CANCELLED, (int32_t)code};
+        }
+        return not_dir_on_the_way(to, win_err(code));
+    }
+
+    if (!(flags & FS_KEEP_METADATA))
+    {
+        err = touch_mtime(tmp); /* CopyFileExW kept the source's */
+    }
+    if (fs_ok(err))
+    {
+        DWORD mf = MOVEFILE_WRITE_THROUGH;
+        if (flags & FS_REPLACE)
+        {
+            mf |= MOVEFILE_REPLACE_EXISTING;
+        }
+        if (!MoveFileExW(tmp, wt, mf))
+        {
+            err = last_err();
+        }
+    }
+    if (!fs_ok(err))
+    {
+        delete_file(tmp);
+    }
+    return err;
+}
+
+/* The reparse data of a symlink or junction (ntifs.h's
+ * REPARSE_DATA_BUFFER, which the SDK headers do not all have). */
+typedef struct
+{
+    ULONG tag;
+    USHORT data_len;
+    USHORT reserved;
+    USHORT subst_off, subst_len, print_off, print_len;
+    union {
+        struct
+        {
+            ULONG flags; /* 1: relative */
+            WCHAR path[1];
+        } symlink;
+        struct
+        {
+            WCHAR path[1];
+        } junction;
+    } u;
+} filec_reparse_t;
+
+#define REPARSE_MAX (16 * 1024) /* MAXIMUM_REPARSE_DATA_BUFFER_SIZE */
+#define SYMLINK_RELATIVE 1u
+
+/* UTF-16 units -> UTF-8, appended to out ('\' becomes '/' when slashes). */
+static fs_err_t append_utf8(
+    const wchar_t *w, size_t n, bool slashes, strbuf_t *out)
+{
+    char buf[3 * WPATH_MAX];
+    int bytes = n ? WideCharToMultiByte(
+                        CP_UTF8, 0, w, (int)n, buf, (int)sizeof buf, NULL, NULL)
+                  : 0;
+    if (n && bytes <= 0)
+    {
+        return last_err();
+    }
+    for (int i = 0; slashes && i < bytes; i++)
+    {
+        if (buf[i] == '\\')
+        {
+            buf[i] = '/';
+        }
+    }
+    return strbuf_append(out, (string_t){buf, (size_t)bytes}) == SEQC_OK
+               ? ok
+               : (fs_err_t){FS_ERR_OOM, 0};
+}
+
+/* An NT path ("\??\C:\x", "\??\UNC\srv\share\x") or a "\\?\" one -> a
+ * Win32 one ("C:\x", "\\srv\share\x"), as UTF-8 -> canonical, appended. */
+static fs_err_t append_canonical(const wchar_t *w, size_t n, strbuf_t *out)
+{
+    char buf[3 * WPATH_MAX + 2];
+    size_t at = 0;
+    if (n >= 8
+        && (wcsncmp(w, L"\\??\\UNC\\", 8) == 0
+            || wcsncmp(w, L"\\\\?\\UNC\\", 8) == 0))
+    {
+        buf[at++] = '\\';
+        buf[at++] = '\\';
+        w += 8;
+        n -= 8;
+    }
+    else if (
+        n >= 4
+        && (wcsncmp(w, L"\\??\\", 4) == 0 || wcsncmp(w, L"\\\\?\\", 4) == 0))
+    {
+        w += 4;
+        n -= 4;
+    }
+    int bytes = n ? WideCharToMultiByte(
+                        CP_UTF8,
+                        0,
+                        w,
+                        (int)n,
+                        buf + at,
+                        (int)(sizeof buf - at),
+                        NULL,
+                        NULL)
+                  : 0;
+    if (n && bytes <= 0)
+    {
+        return last_err();
+    }
+    string_t native = {buf, at + (size_t)bytes};
+    switch (path_from_native(native, PATH_STYLE_WINDOWS, out))
+    {
+    case PATH_NATIVE_OK:
+        return ok;
+    case PATH_NATIVE_OOM:
+        return (fs_err_t){FS_ERR_OOM, 0};
+    default:
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+}
+
+fs_err_t fs_read_link(string_t path, strbuf_t *out)
+{
+    if (!out)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    wchar_t w[WPATH_MAX];
+    fs_err_t err = to_wide(path, w);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    HANDLE h = open_for_metadata(w, false);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        return not_dir_on_the_way(path, last_err());
+    }
+    _Alignas(ULONG) char data[REPARSE_MAX];
+    DWORD got = 0;
+    BOOL read = DeviceIoControl(
+        h, FSCTL_GET_REPARSE_POINT, NULL, 0, data, sizeof data, &got, NULL);
+    DWORD code = GetLastError();
+    CloseHandle(h);
+    if (!read)
+    {
+        return code == ERROR_NOT_A_REPARSE_POINT
+                   ? (fs_err_t){FS_ERR_INVALID, (int32_t)code} /* no link */
+                   : win_err(code);
+    }
+
+    const filec_reparse_t *r = (const filec_reparse_t *)data;
+    const WCHAR *names;
+    bool relative = false;
+    if (r->tag == IO_REPARSE_TAG_SYMLINK)
+    {
+        names = r->u.symlink.path;
+        relative = (r->u.symlink.flags & SYMLINK_RELATIVE) != 0;
+    }
+    else if (r->tag == IO_REPARSE_TAG_MOUNT_POINT)
+    {
+        names = r->u.junction.path;
+    }
+    else
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0}; /* a reparse point, no link */
+    }
+    const wchar_t *subst = names + r->subst_off / sizeof(WCHAR);
+    size_t subst_len = r->subst_len / sizeof(WCHAR);
+
+    /* As stored: a relative target with '/', an absolute one canonical. */
+    return relative ? append_utf8(subst, subst_len, true, out)
+                    : append_canonical(subst, subst_len, out);
+}
+
+fs_err_t fs_real_path(string_t path, strbuf_t *out)
+{
+    if (!out)
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    wchar_t w[WPATH_MAX];
+    fs_err_t err = to_wide(path, w);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    HANDLE h = open_for_metadata(w, true);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        return not_dir_on_the_way(path, last_err());
+    }
+    wchar_t final[WPATH_MAX];
+    DWORD n = GetFinalPathNameByHandleW(
+        h, final, WPATH_MAX, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    err = n == 0           ? last_err()
+          : n >= WPATH_MAX ? (fs_err_t){FS_ERR_NAME_TOO_LONG, 0}
+                           : ok;
+    CloseHandle(h);
+    return fs_ok(err) ? append_canonical(final, n, out) : err;
 }
