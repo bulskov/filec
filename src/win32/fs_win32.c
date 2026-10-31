@@ -1501,7 +1501,7 @@ fs_err_t fs_cwd(strbuf_t *out)
 
 fs_err_t fs_location(fs_loc_t loc, strbuf_t *out)
 {
-    if (!out || (unsigned)loc > (unsigned)FS_LOC_DATA)
+    if (!out || (unsigned)loc > (unsigned)FS_LOC_STATE)
     {
         return (fs_err_t){FS_ERR_INVALID, 0};
     }
@@ -1522,6 +1522,7 @@ fs_err_t fs_location(fs_loc_t loc, strbuf_t *out)
         return append_canonical(w, n, out);
     }
 
+    /* config roams; cache, data and state stay on this machine */
     const GUID *id = loc == FS_LOC_HOME     ? &folder_profile
                      : loc == FS_LOC_CONFIG ? &folder_roaming
                                             : &folder_local;

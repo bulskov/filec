@@ -241,7 +241,12 @@ TEST(cwd_appends)
  * ========================================================================= */
 
 static const fs_loc_t all_locs[] = {
-    FS_LOC_HOME, FS_LOC_TEMP, FS_LOC_CONFIG, FS_LOC_CACHE, FS_LOC_DATA};
+    FS_LOC_HOME,
+    FS_LOC_TEMP,
+    FS_LOC_CONFIG,
+    FS_LOC_CACHE,
+    FS_LOC_DATA,
+    FS_LOC_STATE};
 
 /* Whatever the platform: an answer, canonical and absolute. */
 TEST(location_gives_canonical_paths)
@@ -291,6 +296,7 @@ TEST(location_follows_home)
     env_set("XDG_CONFIG_HOME", NULL);
     env_set("XDG_CACHE_HOME", NULL);
     env_set("XDG_DATA_HOME", NULL);
+    env_set("XDG_STATE_HOME", NULL);
     char home[8192];
     snprintf(home, sizeof home, "%s", c(FX("")));
     ASSERT_EQ(FS_OK, KIND(fs_location(FS_LOC_HOME, sb)));
@@ -304,10 +310,12 @@ TEST(location_follows_home)
         {FS_LOC_CONFIG, "Library/Application Support"},
         {FS_LOC_CACHE, "Library/Caches"},
         {FS_LOC_DATA, "Library/Application Support"},
+        {FS_LOC_STATE, "Library/Application Support"},
 #else
         {FS_LOC_CONFIG, ".config"},
         {FS_LOC_CACHE, ".cache"},
         {FS_LOC_DATA, ".local/share"},
+        {FS_LOC_STATE, ".local/state"},
 #endif
     };
     for (size_t i = 0; i < sizeof under / sizeof under[0]; i++)
@@ -335,6 +343,7 @@ TEST(location_follows_xdg)
     env_set("XDG_CONFIG_HOME", fx_native(FX("cfg")));
     env_set("XDG_CACHE_HOME", "relative/cache");
     env_set("XDG_DATA_HOME", fx_native(FX("data/dir/")));
+    env_set("XDG_STATE_HOME", fx_native(FX("state")));
     ASSERT_EQ(FS_OK, KIND(fs_location(FS_LOC_CONFIG, sb)));
     ASSERT_STR_EQ(c(FX("cfg")), c(strbuf_view(sb)));
     strbuf_clear(sb);
@@ -343,6 +352,9 @@ TEST(location_follows_xdg)
     strbuf_clear(sb);
     ASSERT_EQ(FS_OK, KIND(fs_location(FS_LOC_DATA, sb)));
     ASSERT_STR_EQ(c(FX("data/dir")), c(strbuf_view(sb))); /* normalised */
+    strbuf_clear(sb);
+    ASSERT_EQ(FS_OK, KIND(fs_location(FS_LOC_STATE, sb)));
+    ASSERT_STR_EQ(c(FX("state")), c(strbuf_view(sb)));
 }
 #endif
 

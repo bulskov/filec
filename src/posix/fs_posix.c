@@ -1081,7 +1081,7 @@ static fs_err_t home_dir(char *buf, size_t size)
 
 fs_err_t fs_location(fs_loc_t loc, strbuf_t *out)
 {
-    if (!out || (unsigned)loc > (unsigned)FS_LOC_DATA)
+    if (!out || (unsigned)loc > (unsigned)FS_LOC_STATE)
     {
         return (fs_err_t){FS_ERR_INVALID, 0};
     }
@@ -1096,6 +1096,7 @@ fs_err_t fs_location(fs_loc_t loc, strbuf_t *out)
     const char *xdg = loc == FS_LOC_CONFIG  ? absolute_env("XDG_CONFIG_HOME")
                       : loc == FS_LOC_CACHE ? absolute_env("XDG_CACHE_HOME")
                       : loc == FS_LOC_DATA  ? absolute_env("XDG_DATA_HOME")
+                      : loc == FS_LOC_STATE ? absolute_env("XDG_STATE_HOME")
                                             : NULL;
     if (xdg)
     {
@@ -1117,6 +1118,7 @@ fs_err_t fs_location(fs_loc_t loc, strbuf_t *out)
     const char *under = loc == FS_LOC_CONFIG  ? ".config"
                         : loc == FS_LOC_CACHE ? ".cache"
                         : loc == FS_LOC_DATA  ? ".local/share"
+                        : loc == FS_LOC_STATE ? ".local/state"
                                               : "";
 #endif
     char buf[2 * FILEC_PATH_BUF_MAX];

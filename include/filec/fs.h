@@ -371,6 +371,7 @@ typedef enum
     FS_LOC_CONFIG,
     FS_LOC_CACHE,
     FS_LOC_DATA,
+    FS_LOC_STATE,
 } fs_loc_t;
 
 /* Where things go, appended to out: canonical, absolute, normalised.  The
@@ -386,6 +387,11 @@ typedef enum
  *              ~/.cache
  *   DATA       $XDG_DATA_HOME,          ~/Library/Application    LocalAppData
  *              ~/.local/share           Support
+ *   STATE      $XDG_STATE_HOME,         ~/Library/Application    LocalAppData
+ *              ~/.local/state           Support
+ *
+ * STATE is what a program keeps between runs that is not worth backing
+ * up or syncing: a session, a history, recent files.
  *
  * An environment variable counts only if it holds an absolute path (the
  * XDG spec says to ignore a relative one); without $HOME the password
