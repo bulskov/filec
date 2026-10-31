@@ -945,6 +945,46 @@ fs_err_t fs_copy_file(
     return err;
 }
 
+fs_err_t fs_symlink(string_t target, string_t link, uint32_t flags)
+{
+    (void)flags; /* one kind of link here */
+    char link_buf[FILEC_PATH_BUF_MAX];
+    fs_err_t err = filec_path_cstr(link, link_buf, sizeof link_buf);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    char t[FILEC_PATH_BUF_MAX];
+    if (target.len == 0 || memchr(target.ptr, '\0', target.len))
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    if (path_is_absolute(target))
+    {
+        err = filec_path_cstr(target, t, sizeof t); /* canonical: native */
+        if (!fs_ok(err))
+        {
+            return err;
+        }
+    }
+    else if (target.len < sizeof t)
+    {
+        memcpy(t, target.ptr, target.len); /* relative: as it is */
+        t[target.len] = '\0';
+    }
+    else
+    {
+        return (fs_err_t){FS_ERR_NAME_TOO_LONG, 0};
+    }
+    if (symlink(t, link_buf) != 0)
+    {
+        /* EPERM: the volume has no links (FAT) */
+        return errno == EPERM ? (fs_err_t){FS_ERR_UNSUPPORTED, EPERM}
+                              : filec_from_errno(errno);
+    }
+    return posix_ok;
+}
+
 fs_err_t fs_read_link(string_t path, strbuf_t *out)
 {
     if (!out)

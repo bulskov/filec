@@ -558,6 +558,66 @@ TEST(read_link_errors)
 }
 
 /* =========================================================================
+ * fs_symlink
+ * ========================================================================= */
+
+/* Made as fs_read_link reads it: relative stays relative, absolute is
+ * canonical, dangling is fine; a directory's link is listed through. */
+TEST(symlink_makes_what_read_link_reads)
+{
+    ASSERT_TRUE(fx_write_file("target", "x"));
+    ASSERT_TRUE(fx_mkdir("d"));
+    ASSERT_TRUE(fx_write_file("d/in", "y"));
+    fs_err_t err = fs_symlink(P("target"), FX("l1"), 0);
+    if (err.kind == FS_ERR_UNSUPPORTED)
+    {
+        return; /* no symlinks here (Windows without developer mode) */
+    }
+    ASSERT_EQ(FS_OK, err.kind);
+    ASSERT_EQ(FS_OK, KIND(fs_read_link(FX("l1"), sb)));
+    ASSERT_STR_EQ("target", c(strbuf_view(sb)));
+    ASSERT_TRUE(fs_exists(FX("l1"))); /* followed: the file */
+
+    /* to a directory: Windows makes a directory's link, unasked */
+    ASSERT_EQ(FS_OK, KIND(fs_symlink(P("d"), FX("ld"), 0)));
+    ASSERT_EQ(1, fx_count_entries("ld"));
+
+    /* relative to the link's directory, dangling */
+    ASSERT_EQ(FS_OK, KIND(fs_symlink(P("../x"), FX("d/l3"), 0)));
+    strbuf_clear(sb);
+    ASSERT_EQ(FS_OK, KIND(fs_read_link(FX("d/l3"), sb)));
+    ASSERT_STR_EQ("../x", c(strbuf_view(sb)));
+    ASSERT_FALSE(fs_exists(FX("d/l3")));
+
+    /* absolute */
+    ASSERT_EQ(FS_OK, KIND(fs_symlink(FX("target"), FX("la"), 0)));
+    strbuf_clear(sb);
+    ASSERT_EQ(FS_OK, KIND(fs_read_link(FX("la"), sb)));
+    ASSERT_STR_EQ(c(FX("target")), c(strbuf_view(sb)));
+
+    /* a directory not there yet: FS_LINK_DIR, and once it is, listed */
+    ASSERT_EQ(FS_OK, KIND(fs_symlink(P("later"), FX("lt"), FS_LINK_DIR)));
+    ASSERT_TRUE(fx_mkdir("later"));
+    ASSERT_TRUE(fx_write_file("later/z", "z"));
+    ASSERT_EQ(1, fx_count_entries("lt"));
+}
+
+TEST(symlink_errors)
+{
+    ASSERT_TRUE(fx_write_file("f", "keep"));
+    fs_err_t err = fs_symlink(P("x"), FX("f"), 0);
+    if (err.kind == FS_ERR_UNSUPPORTED)
+    {
+        return; /* no symlinks here */
+    }
+    ASSERT_EQ(FS_ERR_EXISTS, err.kind);
+    ASSERT_STR_EQ("keep", fx_read_file("f", NULL)); /* untouched */
+    ASSERT_EQ(FS_ERR_INVALID, KIND(fs_symlink(P("x"), P("relative"), 0)));
+    ASSERT_EQ(FS_ERR_INVALID, KIND(fs_symlink(P(""), FX("l"), 0)));
+    ASSERT_FALSE(fs_exists(FX("l")));
+}
+
+/* =========================================================================
  * fs_real_path
  * ========================================================================= */
 

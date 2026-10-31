@@ -1369,6 +1369,114 @@ static fs_err_t append_canonical(const wchar_t *w, size_t n, strbuf_t *out)
     }
 }
 
+#ifndef SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+#define SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE 0x2 /* older headers */
+#endif
+
+/* A directory at path (canonical)? */
+static bool is_dir_at(string_t path)
+{
+    wchar_t w[WPATH_MAX];
+    if (!fs_ok(to_wide(path, w)))
+    {
+        return false;
+    }
+    DWORD a = GetFileAttributesW(w);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+fs_err_t fs_symlink(string_t target, string_t link, uint32_t flags)
+{
+    wchar_t wl[WPATH_MAX], wt[WPATH_MAX];
+    fs_err_t err = to_wide(link, wl);
+    if (!fs_ok(err))
+    {
+        return err;
+    }
+    if (target.len == 0 || memchr(target.ptr, '\0', target.len))
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    bool dir = (flags & FS_LINK_DIR) != 0;
+    const wchar_t *t = wt;
+    if (path_is_absolute(target))
+    {
+        err = to_wide(target, wt);
+        if (!fs_ok(err))
+        {
+            return err;
+        }
+        dir = dir || is_dir_at(target);
+        /* stored as the system writes it ("C:\x", "\\srv\share"), not
+         * with the long-path prefix to_wide puts on */
+        if (wcsncmp(wt, L"\\\\?\\UNC\\", 8) == 0)
+        {
+            wt[6] = L'\\';
+            t = wt + 6;
+        }
+        else
+        {
+            t = wt + 4;
+        }
+    }
+    else
+    {
+        int units = MultiByteToWideChar(
+            CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            target.ptr,
+            (int)target.len,
+            wt,
+            WPATH_MAX - 1);
+        if (units == 0)
+        {
+            return (fs_err_t){FS_ERR_INVALID, (int32_t)GetLastError()};
+        }
+        wt[units] = L'\0';
+        for (int i = 0; i < units; ++i)
+        {
+            wt[i] = wt[i] == L'/' ? L'\\' : wt[i];
+        }
+        if (!dir)
+        {
+            /* what it names, from the link's directory */
+            char mem[NATIVE_ARENA];
+            fixed_arena_t arena;
+            fixed_arena_init(&arena, mem, sizeof mem);
+            strbuf_t *sb = strbuf_create(fixed_arena_allocator(&arena));
+            dir = sb && path_join(path_parent(link), target, sb) == PATH_OK
+                  && is_dir_at(strbuf_view(sb));
+        }
+    }
+    DWORD kind = dir ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
+    DWORD code = 0;
+    if (!CreateSymbolicLinkW(
+            wl, t, kind | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE))
+    {
+        code = GetLastError();
+        /* a Windows before 10 1703 does not know the flag: without it */
+        if (code == ERROR_INVALID_PARAMETER && CreateSymbolicLinkW(wl, t, kind))
+        {
+            code = 0;
+        }
+        else if (code == ERROR_INVALID_PARAMETER)
+        {
+            code = GetLastError();
+        }
+    }
+    switch (code)
+    {
+    case 0:
+        return ok;
+    case ERROR_PRIVILEGE_NOT_HELD: /* no Developer Mode */
+    case ERROR_NOT_SUPPORTED:      /* FAT */
+    case ERROR_INVALID_FUNCTION:
+        return (fs_err_t){FS_ERR_UNSUPPORTED, (int32_t)code};
+    default:
+        return win_err(code);
+    }
+}
+
 fs_err_t fs_read_link(string_t path, strbuf_t *out)
 {
     if (!out)
