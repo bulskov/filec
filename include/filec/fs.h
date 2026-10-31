@@ -206,6 +206,29 @@ bool fs_exists(string_t path);
  * failure out is unchanged. */
 FS_NODISCARD fs_err_t fs_read_link(string_t path, strbuf_t *out);
 
+/* fs_symlink's flags. */
+enum
+{
+    FS_LINK_DIR = 1u << 0, /* Windows: a directory's link, whatever the
+                              target is now (one not there yet) */
+};
+
+/* A symbolic link at link to target, target as fs_read_link gives it: a
+ * relative one ("../x", '/' as the separator) is relative to the link's
+ * directory and stays relative; an absolute one is canonical.  So a link
+ * read can be made again as it was.  The target need not exist.
+ *
+ * Windows fixes a link's kind when it is made: a directory's (which can
+ * be listed through) when the target is a directory, or with
+ * FS_LINK_DIR; a file's otherwise.  POSIX has one kind: flags are
+ * ignored.
+ *
+ * Something at link: FS_ERR_EXISTS, untouched.  No links can be made
+ * here — Windows without Developer Mode (or the privilege), a volume
+ * without them (FAT): FS_ERR_UNSUPPORTED. */
+FS_NODISCARD fs_err_t
+fs_symlink(string_t target, string_t link, uint32_t flags);
+
 /* path with every link resolved, appended to out: canonical and absolute,
  * the path the file is really at (also the long form of a Windows 8.3
  * name).  Missing, or a dangling link: FS_ERR_NOT_FOUND; links in a
