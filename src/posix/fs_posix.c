@@ -1309,6 +1309,27 @@ static bool is_removable(const char *majmin)
     return realpath(p, real) && strstr(real, "/usb") != NULL;
 }
 
+/* udev's escapes (\x20 for a space) undone, s into buf; its length. */
+static size_t unescape_hex(const char *s, char *buf, size_t size)
+{
+    size_t len = 0;
+    while (*s && len + 1 < size)
+    {
+        unsigned hex;
+        if (s[0] == '\\' && s[1] == 'x' && sscanf(s + 2, "%2x", &hex) == 1)
+        {
+            buf[len++] = (char)hex;
+            s += 4;
+        }
+        else
+        {
+            buf[len++] = *s++;
+        }
+    }
+    buf[len] = '\0';
+    return len;
+}
+
 /* The label of the block device source, from /dev/disk/by-label (udev
  * escapes a space as \x20 there), into buf; "" if it has none. */
 static size_t device_label(const char *source, char *buf, size_t size)
@@ -1335,20 +1356,7 @@ static size_t device_label(const char *source, char *buf, size_t size)
         {
             continue;
         }
-        for (const char *s = e->d_name; *s && len + 1 < size;)
-        {
-            unsigned hex;
-            if (s[0] == '\\' && s[1] == 'x' && sscanf(s + 2, "%2x", &hex) == 1)
-            {
-                buf[len++] = (char)hex;
-                s += 4;
-            }
-            else
-            {
-                buf[len++] = *s++;
-            }
-        }
-        buf[len] = '\0';
+        len = unescape_hex(e->d_name, buf, size);
         break;
     }
     closedir(d);
@@ -1403,7 +1411,9 @@ static bool mountinfo_line(char *line, allocator_t a, vec_t *out)
     return push_volume(a, out, mount, mount_len, label, label_len, v);
 }
 
-static fs_err_t list_volumes(allocator_t a, vec_t *out)
+/* Each line of /proc/self/mountinfo to fn, NUL-ended and its own to cut
+ * up, until fn says to stop (false). */
+static fs_err_t mountinfo_each(bool (*fn)(char *line, void *ctx), void *ctx)
 {
     int fd = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC);
     if (fd < 0)
@@ -1413,6 +1423,7 @@ static fs_err_t list_volumes(allocator_t a, vec_t *out)
     char buf[64 * 1024];
     size_t have = 0;
     fs_err_t err = posix_ok;
+    bool stop = false;
     for (;;)
     {
         ssize_t n = read(fd, buf + have, sizeof buf - 1 - have);
@@ -1432,14 +1443,14 @@ static fs_err_t list_volumes(allocator_t a, vec_t *out)
         while ((nl = memchr(start, '\n', have - (size_t)(start - buf))))
         {
             *nl = '\0';
-            if (!mountinfo_line(start, a, out))
+            if (!fn(start, ctx))
             {
-                err = (fs_err_t){FS_ERR_OOM, 0};
+                stop = true;
                 break;
             }
             start = nl + 1;
         }
-        if (!fs_ok(err) || n == 0)
+        if (stop || n == 0)
         {
             break;
         }
@@ -1453,6 +1464,27 @@ static fs_err_t list_volumes(allocator_t a, vec_t *out)
     }
     close(fd);
     return err;
+}
+
+typedef struct
+{
+    allocator_t a;
+    vec_t *out;
+    bool oom;
+} volumes_ctx_t;
+
+static bool volume_line(char *line, void *ctx)
+{
+    volumes_ctx_t *v = ctx;
+    v->oom = !mountinfo_line(line, v->a, v->out);
+    return !v->oom;
+}
+
+static fs_err_t list_volumes(allocator_t a, vec_t *out)
+{
+    volumes_ctx_t v = {a, out, false};
+    fs_err_t err = mountinfo_each(volume_line, &v);
+    return v.oom ? (fs_err_t){FS_ERR_OOM, 0} : err;
 }
 
 #elif defined(__APPLE__)
@@ -1516,6 +1548,352 @@ fs_err_t fs_volumes(allocator_t a, vec_t *out)
         vec_truncate(out, mark);
     }
     return err;
+}
+
+/* --- Drives (fs_drives, fs_mount) ----------------------------------------- */
+
+#if defined(__linux__)
+
+#include <spawn.h>
+#include <sys/sysmacros.h>
+#include <sys/wait.h>
+
+/* udev's word on a block device: its database, /run/udev/data/b<maj:min>,
+ * "E:KEY=value" lines. */
+typedef struct
+{
+    char type[32];
+    char label[256];
+    size_t label_len;
+    bool filesystem; /* ID_FS_USAGE=filesystem */
+    bool ignore;     /* UDISKS_IGNORE=1: udisks would not show it */
+} udev_block_t;
+
+static bool udev_block(const char *majmin, udev_block_t *u)
+{
+    *u = (udev_block_t){0};
+    char p[64], buf[16 * 1024];
+    snprintf(p, sizeof p, "/run/udev/data/b%s", majmin);
+    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        return false;
+    }
+    size_t have = 0;
+    while (have < sizeof buf - 1)
+    {
+        ssize_t n = read(fd, buf + have, sizeof buf - 1 - have);
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (n <= 0)
+        {
+            break;
+        }
+        have += (size_t)n;
+    }
+    close(fd);
+    buf[have] = '\0';
+    char *next;
+    for (char *line = buf; *line; line = next)
+    {
+        next = strchr(line, '\n');
+        next = next ? (*next = '\0', next + 1) : line + strlen(line);
+        char *eq = strchr(line, '=');
+        if (strncmp(line, "E:", 2) != 0 || !eq)
+        {
+            continue;
+        }
+        *eq = '\0';
+        const char *key = line + 2, *value = eq + 1;
+        if (strcmp(key, "ID_FS_TYPE") == 0)
+        {
+            snprintf(u->type, sizeof u->type, "%s", value);
+        }
+        else if (strcmp(key, "ID_FS_USAGE") == 0)
+        {
+            u->filesystem = strcmp(value, "filesystem") == 0;
+        }
+        else if (strcmp(key, "UDISKS_IGNORE") == 0)
+        {
+            u->ignore = strcmp(value, "1") == 0;
+        }
+        else if (strcmp(key, "ID_FS_LABEL_ENC") == 0)
+        {
+            u->label_len = unescape_hex(value, u->label, sizeof u->label);
+        }
+    }
+    return true;
+}
+
+/* Where a device is mounted: the first line of mountinfo with its number,
+ * or with it as the source (btrfs gives a number of its own; a source
+ * may be another name for it, /dev/mapper/x for /dev/dm-0). */
+typedef struct
+{
+    const char *majmin, *dev;
+    char *at;
+    size_t cap, len;
+} mount_find_t;
+
+static bool mount_line(char *line, void *ctx)
+{
+    mount_find_t *m = ctx;
+    char *field[6];
+    char *save = NULL;
+    for (int i = 0; i < 6; i++)
+    {
+        field[i] = strtok_r(i ? NULL : line, " ", &save);
+        if (!field[i])
+        {
+            return true;
+        }
+    }
+    char *t;
+    while ((t = strtok_r(NULL, " ", &save)) != NULL && strcmp(t, "-") != 0)
+    {
+    }
+    char *type = t ? strtok_r(NULL, " ", &save) : NULL;
+    char *source = type ? strtok_r(NULL, " ", &save) : NULL;
+    bool same = strcmp(field[2], m->majmin) == 0;
+    if (!same && source && strncmp(source, "/dev/", 5) == 0)
+    {
+        unescape_octal(source);
+        char real[PATH_MAX];
+        same = strcmp(source, m->dev) == 0
+               || (realpath(source, real) && strcmp(real, m->dev) == 0);
+    }
+    if (!same)
+    {
+        return true;
+    }
+    size_t n = unescape_octal(field[4]);
+    if (n < m->cap)
+    {
+        memcpy(m->at, field[4], n + 1);
+        m->len = n;
+    }
+    return false; /* the first */
+}
+
+static size_t mount_of(
+    const char *majmin, const char *dev, char *at, size_t cap)
+{
+    mount_find_t m = {majmin, dev, at, cap, 0};
+    (void)mountinfo_each(mount_line, &m);
+    return m.len;
+}
+
+static bool skipped_device(const char *name)
+{
+    return name[0] == '.' || strncmp(name, "loop", 4) == 0
+           || strncmp(name, "ram", 3) == 0 || strncmp(name, "zram", 4) == 0;
+}
+
+static fs_err_t list_drives(allocator_t a, vec_t *out)
+{
+    DIR *d = opendir("/sys/class/block");
+    if (!d)
+    {
+        return posix_ok; /* no /sys: none to be had */
+    }
+    fs_err_t err = posix_ok;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL)
+    {
+        const char *name = e->d_name;
+        char p[PATH_MAX], majmin[32], size[32];
+        udev_block_t u;
+        snprintf(p, sizeof p, "/sys/class/block/%s/dev", name);
+        if (skipped_device(name) || !read_small(p, majmin, sizeof majmin))
+        {
+            continue;
+        }
+        majmin[strcspn(majmin, "\n")] = '\0';
+        if (!udev_block(majmin, &u) || !u.filesystem || u.ignore)
+        {
+            continue;
+        }
+        fs_drive_t v = {0};
+        snprintf(p, sizeof p, "/sys/class/block/%s/size", name);
+        if (read_small(p, size, sizeof size))
+        {
+            v.size = strtoull(size, NULL, 10) * 512; /* always 512's */
+        }
+        v.removable = is_removable(majmin);
+        char dev[PATH_MAX], at[PATH_MAX];
+        int dev_len = snprintf(dev, sizeof dev, "/dev/%s", name);
+        size_t at_len = mount_of(majmin, dev, at, sizeof at);
+        if (dev_len <= 0 || (size_t)dev_len >= sizeof dev)
+        {
+            continue;
+        }
+        if (!filec_dup_string(a, dev, (size_t)dev_len, &v.device)
+            || !filec_dup_string(a, at, at_len, &v.path)
+            || !filec_dup_string(a, u.label, u.label_len, &v.label)
+            || !filec_dup_string(a, u.type, strlen(u.type), &v.type)
+            || vec_push(out, &v) != SEQC_OK)
+        {
+            err = (fs_err_t){FS_ERR_OOM, 0};
+            break;
+        }
+    }
+    closedir(d);
+    return err;
+}
+
+/* udisksctl's stderr, read to the end (what does not fit is dropped). */
+static size_t read_all(int fd, char *buf, size_t cap)
+{
+    size_t len = 0;
+    for (;;)
+    {
+        char tmp[1024];
+        ssize_t n = read(fd, tmp, sizeof tmp);
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (n <= 0)
+        {
+            break;
+        }
+        size_t take = (size_t)n < cap - 1 - len ? (size_t)n : cap - 1 - len;
+        memcpy(buf + len, tmp, take);
+        len += take;
+    }
+    buf[len] = '\0';
+    return len;
+}
+
+/* udisksctl mount -b dev, waited for; its stderr says why it failed. */
+static fs_err_t udisksctl_mount(const char *dev)
+{
+    int pipefd[2];
+    if (pipe2(pipefd, O_CLOEXEC) != 0)
+    {
+        return filec_from_errno(errno);
+    }
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_adddup2(&fa, pipefd[1], 2);
+    char *argv[] = {"udisksctl", "mount", "-b", (char *)dev, NULL};
+    pid_t pid;
+    int e = posix_spawnp(&pid, "udisksctl", &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(pipefd[1]);
+    if (e != 0)
+    {
+        close(pipefd[0]);
+        return e == ENOENT ? (fs_err_t){FS_ERR_UNSUPPORTED, e}
+                           : filec_from_errno(e);
+    }
+    char msg[4096];
+    read_all(pipefd[0], msg, sizeof msg);
+    close(pipefd[0]);
+    int status;
+    while (waitpid(pid, &status, 0) < 0)
+    {
+        if (errno != EINTR)
+        {
+            return filec_from_errno(errno);
+        }
+    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+    {
+        return posix_ok;
+    }
+    if (strstr(msg, "AlreadyMounted"))
+    {
+        return posix_ok; /* mounted meanwhile: where, is looked up */
+    }
+    if (strstr(msg, "NotAuthorized"))
+    {
+        return (fs_err_t){FS_ERR_ACCESS, 0};
+    }
+    return (fs_err_t){FS_ERR_IO, WIFEXITED(status) ? WEXITSTATUS(status) : -1};
+}
+
+static fs_err_t mount_drive(const char *dev, strbuf_t *out)
+{
+    struct stat st;
+    if (stat(dev, &st) != 0)
+    {
+        return filec_from_errno(errno);
+    }
+    if (!S_ISBLK(st.st_mode))
+    {
+        return (fs_err_t){FS_ERR_NOT_FOUND, 0};
+    }
+    char majmin[32], at[PATH_MAX];
+    snprintf(
+        majmin, sizeof majmin, "%u:%u", major(st.st_rdev), minor(st.st_rdev));
+    size_t len = mount_of(majmin, dev, at, sizeof at);
+    if (len == 0)
+    {
+        fs_err_t err = udisksctl_mount(dev);
+        if (!fs_ok(err))
+        {
+            return err;
+        }
+        len = mount_of(majmin, dev, at, sizeof at);
+        if (len == 0)
+        {
+            return (fs_err_t){FS_ERR_IO, 0}; /* mounted, but not to be seen */
+        }
+    }
+    return strbuf_append(out, (string_t){at, len}) == SEQC_OK
+               ? posix_ok
+               : (fs_err_t){FS_ERR_OOM, 0};
+}
+
+#else
+
+static fs_err_t list_drives(allocator_t a, vec_t *out)
+{
+    (void)a;
+    (void)out;
+    return posix_ok;
+}
+
+static fs_err_t mount_drive(const char *dev, strbuf_t *out)
+{
+    (void)dev;
+    (void)out;
+    return (fs_err_t){FS_ERR_UNSUPPORTED, 0};
+}
+
+#endif
+
+fs_err_t fs_drives(allocator_t a, vec_t *out)
+{
+    if (!out || vec_elem_size(out) != sizeof(fs_drive_t))
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    size_t mark = vec_len(out);
+    fs_err_t err = list_drives(a, out);
+    if (!fs_ok(err))
+    {
+        vec_truncate(out, mark);
+    }
+    return err;
+}
+
+fs_err_t fs_mount(string_t device, strbuf_t *out)
+{
+    char dev[PATH_MAX];
+    if (!out || device.len == 0 || device.len >= sizeof dev
+        || memchr(device.ptr, 0, device.len))
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    memcpy(dev, device.ptr, device.len);
+    dev[device.len] = '\0';
+    return mount_drive(dev, out);
 }
 
 fs_err_t fs_space(string_t path, uint64_t *total, uint64_t *avail)

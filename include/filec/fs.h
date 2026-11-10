@@ -463,6 +463,53 @@ typedef struct
  * The root ("/" on POSIX) is always there; the order is the system's. */
 FS_NODISCARD fs_err_t fs_volumes(allocator_t a, vec_t *out);
 
+typedef struct
+{
+    string_t device; /* "/dev/sde1": what fs_mount takes                 */
+    string_t path;   /* where it is mounted (canonical); "" when not      */
+    string_t label;  /* the file system's label, may be ""                */
+    string_t type;   /* the file system: "ntfs", "vfat", "ext4" ...       */
+    uint64_t size;   /* bytes                                             */
+    bool removable;  /* a USB stick, a card: /sys says so, or it is on USB */
+} fs_drive_t;
+
+/* The file systems on the machine's drives, mounted or not, appended to
+ * out — a vec_t of fs_drive_t you created (another elem_size is
+ * FS_ERR_INVALID): what a file manager lists to be mounted with a click.
+ * The strings are allocated from a and live as long as it.  On failure
+ * out is unchanged.
+ *
+ *   Linux     /sys/class/block, with udev's word on each (its database,
+ *             /run/udev/data): only file systems, not what udisks is told
+ *             to ignore (a recovery partition, swap); loop, ram and zram
+ *             devices left out; mounted where /proc/self/mountinfo says
+ *             (by the device's number, or by its name: btrfs has a number
+ *             of its own).  No udev database (a container): none.
+ *   elsewhere none: Windows and macOS mount what is attached themselves,
+ *             and fs_volumes lists it.
+ *
+ * The order is the system's. */
+FS_NODISCARD fs_err_t fs_drives(allocator_t a, vec_t *out);
+
+/* Mounts the file system on device (an fs_drive_t's), as a file manager
+ * does: udisks decides where (/run/media/<user>/<label>) and whether this
+ * user may (the desktop asks for a password when it must).  Where it is
+ * mounted is appended to out, canonical — also when it already was.  On
+ * failure out is unchanged.  Blocking, for as long as udisks and the
+ * user take: call it on a worker.
+ *
+ *   Linux     `udisksctl mount -b device` (udisks2), its stdin /dev/null
+ *             so it never asks on a terminal.  Not installed:
+ *             FS_ERR_UNSUPPORTED; refused, or the password dialog
+ *             dismissed: FS_ERR_ACCESS; not a device: FS_ERR_NOT_FOUND;
+ *             anything else: FS_ERR_IO, os_code its exit status.
+ *   elsewhere FS_ERR_UNSUPPORTED.
+ *
+ * Starts a child process and waits for it by its pid: a caller reaping
+ * every child (waitpid(-1)) on another thread at the same time takes
+ * its status away (FS_ERR_IO). */
+FS_NODISCARD fs_err_t fs_mount(string_t device, strbuf_t *out);
+
 /* Size and free space of the volume that holds path (which must exist),
  * in bytes: *avail is what this user may still write (less than the free
  * space where the system keeps some back).  total or avail may be NULL. */
