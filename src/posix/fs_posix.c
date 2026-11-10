@@ -1767,8 +1767,9 @@ static size_t read_all(int fd, char *buf, size_t cap)
     return len;
 }
 
-/* udisksctl mount -b dev, waited for; its stderr says why it failed. */
-static fs_err_t udisksctl_mount(const char *dev)
+/* udisksctl verb -b dev (mount, unmount), waited for; its stderr says
+ * why it failed. */
+static fs_err_t udisksctl(const char *verb, const char *dev)
 {
     int pipefd[2];
     if (pipe2(pipefd, O_CLOEXEC) != 0)
@@ -1780,7 +1781,7 @@ static fs_err_t udisksctl_mount(const char *dev)
     posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
     posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
     posix_spawn_file_actions_adddup2(&fa, pipefd[1], 2);
-    char *argv[] = {"udisksctl", "mount", "-b", (char *)dev, NULL};
+    char *argv[] = {"udisksctl", (char *)verb, "-b", (char *)dev, NULL};
     pid_t pid;
     int e = posix_spawnp(&pid, "udisksctl", &fa, NULL, argv, environ);
     posix_spawn_file_actions_destroy(&fa);
@@ -1806,13 +1807,17 @@ static fs_err_t udisksctl_mount(const char *dev)
     {
         return posix_ok;
     }
-    if (strstr(msg, "AlreadyMounted"))
+    if (strstr(msg, "AlreadyMounted") || strstr(msg, "NotMounted"))
     {
-        return posix_ok; /* mounted meanwhile: where, is looked up */
+        return posix_ok; /* so meanwhile: as asked */
     }
     if (strstr(msg, "NotAuthorized"))
     {
         return (fs_err_t){FS_ERR_ACCESS, 0};
+    }
+    if (strstr(msg, "DeviceBusy") || strstr(msg, "target is busy"))
+    {
+        return (fs_err_t){FS_ERR_BUSY, 0};
     }
     return (fs_err_t){FS_ERR_IO, WIFEXITED(status) ? WEXITSTATUS(status) : -1};
 }
@@ -1834,7 +1839,7 @@ static fs_err_t mount_drive(const char *dev, strbuf_t *out)
     size_t len = mount_of(majmin, dev, at, sizeof at);
     if (len == 0)
     {
-        fs_err_t err = udisksctl_mount(dev);
+        fs_err_t err = udisksctl("mount", dev);
         if (!fs_ok(err))
         {
             return err;
@@ -1850,6 +1855,20 @@ static fs_err_t mount_drive(const char *dev, strbuf_t *out)
                : (fs_err_t){FS_ERR_OOM, 0};
 }
 
+static fs_err_t unmount_drive(const char *dev)
+{
+    struct stat st;
+    if (stat(dev, &st) != 0)
+    {
+        return filec_from_errno(errno);
+    }
+    if (!S_ISBLK(st.st_mode))
+    {
+        return (fs_err_t){FS_ERR_NOT_FOUND, 0};
+    }
+    return udisksctl("unmount", dev);
+}
+
 #else
 
 static fs_err_t list_drives(allocator_t a, vec_t *out)
@@ -1863,6 +1882,12 @@ static fs_err_t mount_drive(const char *dev, strbuf_t *out)
 {
     (void)dev;
     (void)out;
+    return (fs_err_t){FS_ERR_UNSUPPORTED, 0};
+}
+
+static fs_err_t unmount_drive(const char *dev)
+{
+    (void)dev;
     return (fs_err_t){FS_ERR_UNSUPPORTED, 0};
 }
 
@@ -1894,6 +1919,19 @@ fs_err_t fs_mount(string_t device, strbuf_t *out)
     memcpy(dev, device.ptr, device.len);
     dev[device.len] = '\0';
     return mount_drive(dev, out);
+}
+
+fs_err_t fs_unmount(string_t device)
+{
+    char dev[PATH_MAX];
+    if (device.len == 0 || device.len >= sizeof dev
+        || memchr(device.ptr, 0, device.len))
+    {
+        return (fs_err_t){FS_ERR_INVALID, 0};
+    }
+    memcpy(dev, device.ptr, device.len);
+    dev[device.len] = '\0';
+    return unmount_drive(dev);
 }
 
 fs_err_t fs_space(string_t path, uint64_t *total, uint64_t *avail)

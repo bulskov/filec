@@ -87,7 +87,7 @@ in CI on all three (gcc, clang, AddressSanitizer + UBSan, clang-cl).
 | Directories | `fs_dir_list`, `fs_dir_iter` | `tests/fs_dir_test.c` |
 | Operations | `fs_mkdir_all`, `fs_rename`, `fs_copy_file`, `fs_read_link`, `fs_real_path` | `tests/fs_ops_test.c` |
 | Places | `fs_cwd`, `fs_location`, `fs_from_native` | `tests/fs_places_test.c` |
-| Volumes | `fs_volumes`, `fs_space`, `fs_drives`, `fs_mount` | `tests/fs_volume_test.c` |
+| Volumes | `fs_volumes`, `fs_space`, `fs_drives`, `fs_mount`, `fs_unmount` | `tests/fs_volume_test.c` |
 | Watching | `fs_watch_*` | `tests/fs_watch_test.c` |
 | Trash | `fs_trash` | `tests/fs_trash_test.c` |
 

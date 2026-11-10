@@ -510,6 +510,14 @@ FS_NODISCARD fs_err_t fs_drives(allocator_t a, vec_t *out);
  * its status away (FS_ERR_IO). */
 FS_NODISCARD fs_err_t fs_mount(string_t device, strbuf_t *out);
 
+/* Unmounts the file system on device (an fs_drive_t's, mounted), as a
+ * file manager does: `udisksctl unmount -b device` on Linux.  Not
+ * mounted (any more): FS_OK.  In use (a file open on it, a shell in
+ * it): FS_ERR_BUSY; refused: FS_ERR_ACCESS; the rest as fs_mount.
+ * Blocking and a child process, as fs_mount.  Elsewhere
+ * FS_ERR_UNSUPPORTED. */
+FS_NODISCARD fs_err_t fs_unmount(string_t device);
+
 /* Size and free space of the volume that holds path (which must exist),
  * in bytes: *avail is what this user may still write (less than the free
  * space where the system keeps some back).  total or avail may be NULL. */
