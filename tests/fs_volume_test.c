@@ -227,6 +227,51 @@ TEST(volumes_out_of_memory_leaves_out_unchanged)
 }
 
 /* =========================================================================
+ * fs_drives, fs_mount
+ *
+ * Which drives there are differs from machine to machine (and a container
+ * has no udev database: none), so: what is listed is well formed, and
+ * mounting what is not a drive fails without starting anything.
+ * ========================================================================= */
+
+TEST(drives_are_well_formed)
+{
+    vec_t *drives = vec_create(sizeof(fs_drive_t), a);
+    ASSERT_EQ(FS_OK, KIND(fs_drives(a, drives)));
+    for (size_t i = 0; i < vec_len(drives); i++)
+    {
+        const fs_drive_t *d = vec_get_ptr(drives, i);
+        ASSERT_TRUE(string_starts_with(d->device, P("/dev/")));
+        ASSERT_TRUE(d->type.len > 0);
+        ASSERT_TRUE(d->path.len == 0 || is_canonical(d->path));
+    }
+#if !defined(__linux__)
+    ASSERT_EQ(0u, vec_len(drives));
+#endif
+}
+
+TEST(drives_wants_a_vec_of_drives)
+{
+    ASSERT_EQ(FS_ERR_INVALID, KIND(fs_drives(a, vols)));
+    ASSERT_EQ(FS_ERR_INVALID, KIND(fs_drives(a, NULL)));
+}
+
+TEST(mount_what_is_not_a_drive)
+{
+    strbuf_t *out = strbuf_create(a);
+    ASSERT_EQ(FS_ERR_INVALID, KIND(fs_mount(P(""), out)));
+    ASSERT_EQ(FS_ERR_INVALID, KIND(fs_mount(P("/dev/x"), NULL)));
+    ASSERT_TRUE(fx_write_file("f", "x"));
+#if defined(__linux__)
+    ASSERT_EQ(FS_ERR_NOT_FOUND, KIND(fs_mount(P("/dev/no-such-drive"), out)));
+    ASSERT_EQ(FS_ERR_NOT_FOUND, KIND(fs_mount(FX("f"), out)));
+#else
+    ASSERT_EQ(FS_ERR_UNSUPPORTED, KIND(fs_mount(FX("f"), out)));
+#endif
+    ASSERT_EQ(0u, strbuf_len(out));
+}
+
+/* =========================================================================
  * fs_space
  * ========================================================================= */
 

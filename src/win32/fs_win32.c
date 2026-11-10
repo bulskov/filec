@@ -1753,6 +1753,21 @@ fs_err_t fs_volumes(allocator_t a, vec_t *out)
     return err;
 }
 
+/* Windows gives a drive attached its letter itself: fs_volumes has it. */
+fs_err_t fs_drives(allocator_t a, vec_t *out)
+{
+    (void)a;
+    return out && vec_elem_size(out) == sizeof(fs_drive_t)
+               ? (fs_err_t){FS_OK, 0}
+               : (fs_err_t){FS_ERR_INVALID, 0};
+}
+
+fs_err_t fs_mount(string_t device, strbuf_t *out)
+{
+    return !out || device.len == 0 ? (fs_err_t){FS_ERR_INVALID, 0}
+                                   : (fs_err_t){FS_ERR_UNSUPPORTED, 0};
+}
+
 fs_err_t fs_space(string_t path, uint64_t *total, uint64_t *avail)
 {
     wchar_t w[WPATH_MAX];
