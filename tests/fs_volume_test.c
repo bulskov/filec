@@ -271,6 +271,18 @@ TEST(mount_what_is_not_a_drive)
     ASSERT_EQ(0u, strbuf_len(out));
 }
 
+TEST(unmount_what_is_not_a_drive)
+{
+    ASSERT_EQ(FS_ERR_INVALID, KIND(fs_unmount(P(""))));
+    ASSERT_TRUE(fx_write_file("f", "x"));
+#if defined(__linux__)
+    ASSERT_EQ(FS_ERR_NOT_FOUND, KIND(fs_unmount(P("/dev/no-such-drive"))));
+    ASSERT_EQ(FS_ERR_NOT_FOUND, KIND(fs_unmount(FX("f"))));
+#else
+    ASSERT_EQ(FS_ERR_UNSUPPORTED, KIND(fs_unmount(FX("f"))));
+#endif
+}
+
 /* =========================================================================
  * fs_space
  * ========================================================================= */

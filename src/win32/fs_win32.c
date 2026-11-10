@@ -1768,6 +1768,12 @@ fs_err_t fs_mount(string_t device, strbuf_t *out)
                                    : (fs_err_t){FS_ERR_UNSUPPORTED, 0};
 }
 
+fs_err_t fs_unmount(string_t device)
+{
+    return device.len == 0 ? (fs_err_t){FS_ERR_INVALID, 0}
+                           : (fs_err_t){FS_ERR_UNSUPPORTED, 0};
+}
+
 fs_err_t fs_space(string_t path, uint64_t *total, uint64_t *avail)
 {
     wchar_t w[WPATH_MAX];
